@@ -1,0 +1,50 @@
+# --- Build output -------------------------------------------------------
+build/
+out/
+install/
+cmake-build-*/
+
+# CMake scratch
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+compile_commands.json
+_deps/
+
+# --- Binaries and intermediates ------------------------------------------
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.obj
+*.o
+*.a
+*.so
+*.dylib
+
+# Compiled shader blobs (sources in shaders/ are tracked)
+*.cso
+*.dxil
+*.dxbc
+
+# --- Engine runtime data --------------------------------------------------
+# Terraform delta stores / world saves: regenerated, and tied to a
+# generator version (see docs/world-design.md Section 8).
+*.vxd
+
+# Viewer captures
+screenshots/
+
+# --- Editors and OS -------------------------------------------------------
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

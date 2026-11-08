@@ -309,6 +309,31 @@ float4 PSSky(SkyOut i) : SV_Target
 // second adjacent literal. They concatenate into a single array, so
 // sizeof(kShaderSource) still spans both.
 R"HLSL(
+// ---- On-screen overlay ------------------------------------------------------
+cbuffer Overlay : register(b3) { float4 gOverlayRect; };   // x0, y0, x1, y1 in NDC
+Texture2D    gOverlayTex : register(t2);
+SamplerState gOverlaySmp : register(s1);
+
+struct OverlayOut { float4 clip : SV_Position; float2 uv : TEXCOORD0; };
+
+OverlayOut VSOverlay(uint vid : SV_VertexID)
+{
+    OverlayOut o;
+    const float2 c = float2((vid << 1) & 2, vid & 2);          // (0,0) (2,0) (0,2)
+    o.uv   = c;
+    o.clip = float4(lerp(gOverlayRect.xy, gOverlayRect.zw, c), 0.0, 1.0);
+    return o;
+}
+
+float4 PSOverlay(OverlayOut i) : SV_Target
+{
+    if (any(i.uv < 0.0) || any(i.uv > 1.0)) discard;           // the quad is a big triangle
+    const float a = gOverlayTex.Sample(gOverlaySmp, i.uv).a;
+    // Dark panel under white text, so it reads over sky as well as over rock.
+    const float3 col = lerp(float3(0.04, 0.05, 0.07), float3(1.0, 1.0, 1.0), a);
+    return float4(col, max(a, 0.62));
+}
+
 // -----------------------------------------------------------------------------
 // Tessellation: VS -> HS -> DS -> PS, adding micro-relief close to the camera.
 //
@@ -813,6 +838,97 @@ private:
 };
 
 // -----------------------------------------------------------------------------
+// TextOverlay: the controls, on screen.
+//
+// GDI draws the text into a DIB once and that becomes a texture, which is a lot
+// less code than a hand-rolled bitmap font and reads better. GDI does not write
+// an alpha channel though -- it leaves it at whatever was there -- so coverage
+// is recovered from the luminance it did write, which works because the text is
+// drawn white on a cleared buffer.
+// -----------------------------------------------------------------------------
+class TextOverlay {
+public:
+    explicit TextOverlay(ID3D11Device* device) : m_device(device) {}
+
+    // Rebuilds the texture. Cheap enough to call whenever the text changes.
+    bool build(const std::string& text, int width, int lineHeight) {
+        int lines = 1;
+        for (char c : text) if (c == '\n') ++lines;
+        const int height = lines * lineHeight + 14;
+
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = width;
+        bi.bmiHeader.biHeight = -height;          // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+
+        HDC dc = CreateCompatibleDC(nullptr);
+        if (!dc) return false;
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!bmp) { DeleteDC(dc); return false; }
+        HGDIOBJ oldBmp = SelectObject(dc, bmp);
+        std::memset(bits, 0, size_t(width) * size_t(height) * 4);
+
+        HFONT font = CreateFontA(-(lineHeight - 4), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                                 FIXED_PITCH | FF_MODERN, "Consolas");
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        RECT r{10, 7, width - 8, height - 4};
+        DrawTextA(dc, text.c_str(), -1, &r, DT_LEFT | DT_TOP | DT_NOCLIP | DT_EXPANDTABS);
+        GdiFlush();
+
+        // GDI wrote colour but no alpha; the brightness it wrote is the glyph
+        // coverage, so lift it into alpha and leave the text white.
+        auto* px = static_cast<uint8_t*>(bits);
+        for (size_t i = 0, n = size_t(width) * size_t(height); i < n; ++i) {
+            const uint8_t a = std::max({px[i * 4 + 0], px[i * 4 + 1], px[i * 4 + 2]});
+            px[i * 4 + 0] = px[i * 4 + 1] = px[i * 4 + 2] = 255;
+            px[i * 4 + 3] = a;
+        }
+
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = UINT(width); td.Height = UINT(height);
+        td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init{};
+        init.pSysMem = bits;
+        init.SysMemPitch = UINT(width) * 4;
+
+        m_srv.reset();
+        m_tex.reset();
+        const bool ok = SUCCEEDED(m_device->CreateTexture2D(&td, &init, m_tex.put())) &&
+                        SUCCEEDED(m_device->CreateShaderResourceView(m_tex.get(), nullptr, m_srv.put()));
+        m_width = width;
+        m_height = height;
+
+        SelectObject(dc, oldFont);
+        DeleteObject(font);
+        SelectObject(dc, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(dc);
+        return ok;
+    }
+
+    ID3D11ShaderResourceView* srv() const { return m_srv.get(); }
+    int width() const { return m_width; }
+    int height() const { return m_height; }
+
+private:
+    ID3D11Device* m_device;
+    Com<ID3D11Texture2D> m_tex;
+    Com<ID3D11ShaderResourceView> m_srv;
+    int m_width = 0, m_height = 0;
+};
+
+// -----------------------------------------------------------------------------
 // Far-field brick store. Chunks at or beyond StreamerConfig::traceLod arrive
 // here as density instead of geometry. They live in a GPU brick atlas indexed
 // by a world-anchored volume of slot ids, which is what the trace shader walks:
@@ -1035,6 +1151,9 @@ struct ChunkCB {
 };
 static_assert(sizeof(ChunkCB) % 16 == 0);
 
+struct OverlayCB { float rect[4]; };
+static_assert(sizeof(OverlayCB) % 16 == 0);
+
 struct FarCB {
     float camWorld[3];  float chunkSizeM;
     float worldMin[3];  float voxelSizeM;
@@ -1219,7 +1338,9 @@ void printControls() {
         "  click / Tab  capture the mouse (free look).  Tab or Esc releases it\n"
         "  W A S D      move,  Q / E  down / up\n"
         "  Shift        x8 speed,  Ctrl  x1/5 speed,  mouse wheel  set base speed\n"
-        "  LMB / RMB    dig / fill a 5 m sphere under the crosshair (live CSG + remesh)\n"
+        "  H            show / hide the controls on screen\n"
+        "  LMB / RMB    dig / fill under the crosshair (live CSG + remesh)\n"
+        "  - / =        dig radius smaller / larger\n"
         "  G            wireframe,  L  LOD colour tint,  C  backface culling,  R  respawn\n"
         "  [ / ]        flyby speed down / up\n"
         "  Esc          release the mouse, or quit when it is already free\n\n");
@@ -1247,6 +1368,7 @@ int main(int argc, char** argv) {
     bool pipeStats = false;         // count pixel shader invocations: overdraw
     bool stripes = false;           // gradient-aligned stripe erosion on the heights
     float stripeAmp = 5.f, stripeWidth = 60.f;
+    float digRadiusStart = 5.f;     // metres; - / = adjust it at runtime
     bool walk = false;              // first-person: eye height above the ground, no flying
     float eyeHeight = 2.f, walkSpeed = 4.5f;
     bool tess = false;              // hardware tessellation + micro-relief up close
@@ -1280,6 +1402,7 @@ int main(int argc, char** argv) {
         else if (a == "--far-trace") farTrace = true;
         else if (a == "--no-sort") sortChunks = false;
         else if (a == "--stripes") stripes = true;
+        else if (a == "--dig-radius") digRadiusStart = float(next(digRadiusStart));
         else if (a == "--walk") { walk = true; startFlyby = false; }
         else if (a == "--eye") eyeHeight = float(next(eyeHeight));
         else if (a == "--walk-speed") walkSpeed = float(next(walkSpeed));
@@ -1429,6 +1552,36 @@ int main(int argc, char** argv) {
         return 1;
     if (farTrace && !compile("PSFar", "ps_5_0", farPsBlob)) return 1;
 
+    Com<ID3DBlob> ovVsBlob, ovPsBlob;
+    Com<ID3D11VertexShader> ovVs;
+    Com<ID3D11PixelShader> ovPs;
+    if (!compile("VSOverlay", "vs_5_0", ovVsBlob) || !compile("PSOverlay", "ps_5_0", ovPsBlob)) return 1;
+    device->CreateVertexShader(ovVsBlob->GetBufferPointer(), ovVsBlob->GetBufferSize(), nullptr, ovVs.put());
+    device->CreatePixelShader(ovPsBlob->GetBufferPointer(), ovPsBlob->GetBufferSize(), nullptr, ovPs.put());
+
+    Com<ID3D11BlendState> blendAlpha;
+    {
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        device->CreateBlendState(&bd, blendAlpha.put());
+    }
+    Com<ID3D11SamplerState> overlaySampler;
+    {
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        device->CreateSamplerState(&sd, overlaySampler.put());
+    }
+
     Com<ID3DBlob> tessVsBlob, hsBlob, dsBlob;
     Com<ID3D11VertexShader> tessVs;
     Com<ID3D11HullShader> hs;
@@ -1472,8 +1625,10 @@ int main(int argc, char** argv) {
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         return !fail(device->CreateBuffer(&bd, nullptr, out.put()), "CreateBuffer(constant)");
     };
-    Com<ID3D11Buffer> frameCB, chunkCB, farCB;
-    if (!makeCB(sizeof(FrameCB), frameCB) || !makeCB(sizeof(ChunkCB), chunkCB)) return 1;
+    Com<ID3D11Buffer> frameCB, chunkCB, farCB, overlayCB;
+    if (!makeCB(sizeof(FrameCB), frameCB) || !makeCB(sizeof(ChunkCB), chunkCB) ||
+        !makeCB(sizeof(OverlayCB), overlayCB))
+        return 1;
     if (farTrace && !makeCB(sizeof(FarCB), farCB)) return 1;
 
     // DualContouring winds each quad so the right-hand-rule normal points out of
@@ -1637,6 +1792,10 @@ int main(int argc, char** argv) {
     bool cullBackfaces = true;
     bool tessOn = tess;            // T toggles it, when --tess built the shaders
     bool walkSnap = walk;          // first frame in walk mode places the feet rather than easing
+    float digRadius = digRadiusStart;
+    TextOverlay overlay(device.get());
+    bool showOverlay = true;
+    bool overlayDirty = true;
     double flyDistance = 0.0;
     double flySpeed = 55.0;        // metres/second along the loop
     float freeSpeed = 40.f;        // metres/second
@@ -1711,6 +1870,7 @@ int main(int argc, char** argv) {
         if (g_input.takePress('G')) wireframe = !wireframe;
         if (g_input.takePress('L')) lodTint = !lodTint;
         if (g_input.takePress('C')) cullBackfaces = !cullBackfaces;
+        if (g_input.takePress('H')) showOverlay = !showOverlay;
         if (g_input.takePress('V')) {
             walk = !walk;
             if (walk) { flyby = false; walkSnap = true; }
@@ -1727,6 +1887,14 @@ int main(int argc, char** argv) {
         }
         if (g_input.takePress(VK_OEM_4)) flySpeed = std::max(5.0, flySpeed - 10.0);    // '['
         if (g_input.takePress(VK_OEM_6)) flySpeed = std::min(400.0, flySpeed + 10.0);  // ']'
+        if (g_input.takePress(VK_OEM_MINUS)) {                                         // '-'
+            digRadius = std::max(1.f, digRadius - (digRadius > 6.f ? 2.f : 1.f));
+            overlayDirty = true;
+        }
+        if (g_input.takePress(VK_OEM_PLUS)) {                                          // '='
+            digRadius = std::min(24.f, digRadius + (digRadius >= 6.f ? 2.f : 1.f));
+            overlayDirty = true;
+        }
         if (g_input.wheel) {
             freeSpeed = std::clamp(freeSpeed * std::pow(1.25f, float(g_input.wheel)), 1.f, 4000.f);
             g_input.wheel = 0;
@@ -1815,7 +1983,7 @@ int main(int argc, char** argv) {
                 op.op = dig ? BrushOp::Subtract : BrushOp::Add;
                 op.shape = BrushShape::Sphere;
                 op.center = camera.position + Vec3d(dir * (*hit));
-                op.halfExtents = Vec3f(5.f);
+                op.halfExtents = Vec3f(digRadius);
                 op.material = kMatDirt;
                 const auto res = terraformer.apply(op);
                 std::printf("%s at (%.0f, %.0f, %.0f): %u voxels, %u resident samples patched\n",
@@ -2015,6 +2183,62 @@ int main(int argc, char** argv) {
             ctx->PSSetShader(farPs.get(), nullptr, 0);
             ctx->Draw(3, 0);
             FarFieldBricks::unbind(ctx.get());
+        }
+
+        // Overlay last, over everything, alpha blended.
+        if (showOverlay) {
+            if (overlayDirty || !overlay.srv()) {
+                char buf[1024];
+                std::snprintf(buf, sizeof(buf),
+                              "H  hide this\n"
+                              "\n"
+                              "LMB / RMB   dig / fill      radius %.0f m   (- / = to resize)\n"
+                              "W A S D     move,  Q / E up / down (free-cam only)\n"
+                              "Shift       faster,  Ctrl  slower,  wheel  free-cam speed\n"
+                              "Tab         capture the mouse.  Esc releases, then quits\n"
+                              "\n"
+                              "V   walk / free-cam        F   cinematic flyby\n"
+                              "G   wireframe              L   LOD colour tint\n"
+                              "C   backface culling       R   respawn\n"
+                              "T   tessellation           [ / ]  flyby speed",
+                              double(digRadius));
+                overlay.build(buf, 520, 17);
+                overlayDirty = false;
+            }
+            if (overlay.srv()) {
+                // Pin to the top-left in pixels, whatever the window size.
+                const float w = 2.f * float(overlay.width()) / float(g_input.width);
+                const float h = 2.f * float(overlay.height()) / float(g_input.height);
+                const float m = 0.018f;
+                OverlayCB ocb{{-1.f + m, 1.f - m * (float(g_input.width) / float(g_input.height)),
+                               -1.f + m + w, 1.f - m * (float(g_input.width) / float(g_input.height)) - h}};
+                D3D11_MAPPED_SUBRESOURCE map{};
+                ctx->Map(overlayCB.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
+                std::memcpy(map.pData, &ocb, sizeof(ocb));
+                ctx->Unmap(overlayCB.get(), 0);
+
+                ID3D11Buffer* ocbs[] = {overlayCB.get()};
+                ctx->VSSetConstantBuffers(3, 1, ocbs);
+                ctx->PSSetConstantBuffers(3, 1, ocbs);
+                ID3D11ShaderResourceView* srvs[] = {overlay.srv()};
+                ctx->PSSetShaderResources(2, 1, srvs);
+                ID3D11SamplerState* smps[] = {overlaySampler.get()};
+                ctx->PSSetSamplers(1, 1, smps);
+
+                ctx->IASetInputLayout(nullptr);
+                ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx->HSSetShader(nullptr, nullptr, 0);
+                ctx->DSSetShader(nullptr, nullptr, 0);
+                ctx->OMSetDepthStencilState(dssSky.get(), 0);
+                ctx->OMSetBlendState(blendAlpha.get(), nullptr, 0xFFFFFFFF);
+                ctx->RSSetState(rsNoCull.get());
+                ctx->VSSetShader(ovVs.get(), nullptr, 0);
+                ctx->PSSetShader(ovPs.get(), nullptr, 0);
+                ctx->Draw(3, 0);
+                ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+                ID3D11ShaderResourceView* none[] = {nullptr};
+                ctx->PSSetShaderResources(2, 1, none);
+            }
         }
 
         // Capture before Present: with FLIP_DISCARD the back buffer's contents

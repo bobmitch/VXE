@@ -2,7 +2,7 @@
 
 **Status: working draft.** Sections are tagged **[decided]**, **[proposed]** or **[open]**. Only the
 tagged-decided parts are settled; everything else is a starting position to argue with. Nothing here
-is implemented yet.
+is implemented yet, apart from the one item in §9 marked **[done]**.
 
 This document exists because world generation is about to become the long pole, and the generator
 cannot be designed without knowing what the player is supposed to meet. Every section below ends in
@@ -959,18 +959,31 @@ void exists. **A 5 m crater is down to one air sample at LOD3 and none at LOD4.*
 air sample among solid neighbours does not move a dual-contoured isosurface. The hole does not shrink
 with distance — it blinks out.
 
+Two things are wrong there rather than one, and the second is the uglier. A promoted voxel carries
+its **value** as well as its position, so every level reported the crater at its full 6 m depth — a
+void narrower than a cell was not merely misplaced, it was carved at cell size. And which voxel gets
+promoted depends on where the hole happens to fall on the lattice, not on the hole: carving the same
+6 m crater at eight one-voxel offsets gave anywhere from **93 to 136** air samples at LOD1, a 46%
+swing from nothing but alignment. That is the flicker. Reducing the block instead gives **114 every
+time**, and a depth that falls away — 4.9 m at LOD1, 4.0 at LOD2, 2.1 at LOD3 — until the void is
+smaller than a sample can carry.
+
 So the underground needs a scale-aware representation twice over, for two unrelated reasons:
 
 * **Procedural voids can be parametric.** A capsule that knows its own radius is carved
   conservatively at any stride, so it thins instead of vanishing. That is layer 3 of the model below,
   and it is what retires `maxCaveLod`.
-* **Player voids cannot be**, because a dug crater is arbitrary. They need a **mip pyramid**: each
-  coarse sample reduced from the 2^L × 2^L × 2^L fine samples beneath it, rather than chosen from
-  among them.
+* **Player voids cannot be**, because a dug crater is arbitrary. They need **reduction**: each coarse
+  sample derived from the 2^L × 2^L × 2^L fine samples beneath it, rather than chosen from among
+  them. No stored pyramid is needed — the overrides are already sparse, so the block can be reduced
+  while it is being stamped, which costs no memory at all.
 
-The reduction operator is the part wanting care rather than a default. A plain mean erases voids
-about as efficiently as decimation does, and a minimum over the block grows them until the world is
-porous. Dual contouring's QEF keeps edges sharp once the data is there; the data is what is missing.
+**[done]** This one is built: `DeltaStore::applyTo` now reduces, with LOD0 left exactly as it was so
+that a save/load round trip stays bit-identical. The reduction operator turned out to matter less
+than expected. A plain block mean — the correct low-pass filter for a locally linear field — is
+enough, and is the default. Weighting air samples above solid ones buys roughly one more level of
+survival and costs stability at the level below, so it is exposed as a knob rather than chosen.
+Dual contouring's QEF keeps edges sharp once the data is there; the data was what was missing.
 
 ### This is not an argument for a different architecture
 
@@ -997,11 +1010,11 @@ FastNoise2 is built with strict floating point. Holding that guarantee across GP
 revisions is a harder problem than the one it would be solving — and Jolt wants CPU-side triangles
 regardless, so a GPU-only mesh path still owes a readback or a second path for collision.
 
-**Keep the architecture; fix the data production.** In order: the delta mip pyramid, which addresses
-what was actually observed and is contained enough to carry a regression test; then parametric cave
-incursions, which retire `maxCaveLod`; then prefiltering the surface noise, before mechanism 3 is
-noticed in the Badlands. GPU meshing remains available later as a throughput decision, which is what
-it always was.
+**Keep the architecture; fix the data production.** In order: delta reduction, which addresses what
+was actually observed and is contained enough to carry a regression test — now done; then parametric
+cave incursions, which retire `maxCaveLod`; then prefiltering the surface noise, before mechanism 3
+is noticed in the Badlands. GPU meshing remains available later as a throughput decision, which is
+what it always was.
 
 ### What the reference games actually teach
 
@@ -1097,8 +1110,9 @@ Two consequences land immediately:
 * **Coarse levels derived by reduction, not decimation** — every LOD sample a filtered function of
   the fine samples beneath it, for the procedural field and for `DeltaStore` alike. This one is
   independent of everything else here, and it is the fix for what was actually observed.
-* **A mip pyramid for deltas**, so a dug crater thins with distance instead of disappearing. Cheap
-  in memory — a geometric series over the LOD0 set — and gated on choosing a reduction operator.
+* **Reduction for deltas**, so a dug crater thins with distance instead of disappearing — **done**,
+  and it needed no stored pyramid and no extra memory, because overrides are sparse enough to reduce
+  as they are stamped.
 
 **[open]** Where exactly does placement stop and texture begin? Too much placement and every cave is
 a corridor somebody designed; too little and the four failures return wearing a graph. Layer 4's
@@ -1114,11 +1128,11 @@ player has walled off.
 the cheap way into it, but nothing says whether the network is one layer, several stacked, or
 continuous to bedrock — and that decides whether depth is a progression or a single step down.
 
-**[open]** Which reduction operator builds the coarse levels? A mean erases voids nearly as well as
-decimation does; a minimum over the block grows them until the world is porous. Something biased
-toward extremes is the right shape, but the bias has a visible failure mode at each end, it has to
-hold for added terrain as well as removed, and whatever it does at a chunk boundary has to agree
-with the skirts that already cover LOD seams.
+**[open]** How far should the reduction be biased toward air? The block mean is the default and is
+stable, but it loses a void once the void is smaller than a cell — correct by Nyquist, and still a
+pop at whichever LOD that happens. Weighting air samples higher defers it by about a level and erodes
+thin walls in exchange. What is left open is whether the right bias differs for added terrain versus
+removed, and what either does at a chunk boundary, where the skirts already cover LOD seams.
 
 ---
 

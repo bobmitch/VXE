@@ -434,6 +434,86 @@ TEST(delta_store_roundtrip_and_compression) {
     CHECK(!bad.deserialize(corrupt));                       // checksum catches corruption
 }
 
+TEST(delta_voids_coarsen_instead_of_vanishing) {
+    // A coarse sample stands for s^3 LOD0 voxels. Promoting whichever one lands
+    // on the lattice made the coarse field a function of where a hole happened
+    // to sit rather than of the hole: the same crater shifted by one voxel gave
+    // anywhere from 93 to 136 air samples at LOD1, and every LOD reported the
+    // void at its full 6 m depth, so a crater smaller than a cell still carved
+    // a cell-sized one. Reducing the whole block fixes both.
+    constexpr float kRadius = 6.f;
+    constexpr float kProcSolid = -1.f;
+    const Vec3i base{5168, 80, -240};          // dead centre of its LOD0 chunk
+
+    auto carve = [](DeltaStore& s, const Vec3i& c) {
+        const int R = int(kRadius) + 3;
+        DeltaStore::WriteBatch wb(s);
+        for (int dz = -R; dz <= R; ++dz)
+            for (int dy = -R; dy <= R; ++dy)
+                for (int dx = -R; dx <= R; ++dx) {
+                    const float d = std::sqrt(float(dx * dx + dy * dy + dz * dz)) - kRadius;
+                    if (d > 3.f) continue;      // outside the brush influence band
+                    wb.write(Vec3i{c.x + dx, c.y + dy, c.z + dz}, -d, d < 0.f ? kMatAir : kMatRock);
+                }
+    };
+    // Air samples and the deepest point of the void, as the coarse field sees them.
+    auto stamp = [&](const DeltaStore& s, const ChunkKey& k, int& air, float& peak) {
+        auto f = std::make_unique<DensityField>();
+        f->density.fill(kProcSolid);
+        f->material.fill(kMatRock);
+        s.applyTo(k, *f);
+        air = 0;
+        peak = -1e9f;
+        for (size_t i = 0; i < size_t(kFieldVolume); ++i) {
+            if (f->density[i] > 0.f) ++air;
+            peak = std::max(peak, f->density[i]);
+        }
+    };
+    auto keyFor = [](const Vec3i& v, int lod) {
+        ChunkKey k = DeltaStore::ownerChunk(v);
+        for (int i = 0; i < lod; ++i) k = k.parent();
+        return k;
+    };
+
+    // LOD0 is exact: every air voxel of the sphere lands on its own sample.
+    {
+        DeltaStore s;
+        carve(s, base);
+        int air = 0; float peak = 0.f;
+        stamp(s, keyFor(base, 0), air, peak);
+        const int volume = int(4.0 / 3.0 * 3.14159265 * double(kRadius) * kRadius * kRadius);
+        CHECK(air > volume * 9 / 10 && air < volume * 11 / 10);   // ~905 for r=6
+        CHECK(std::abs(peak - kRadius) < 0.05f);                  // full depth at the centre
+    }
+
+    // Shifting the crater by one voxel changes its lattice alignment and
+    // nothing else, so the coarse field must not notice.
+    int firstAir = -1;
+    for (int o = 0; o < 8; ++o) {
+        const Vec3i c{base.x + (o & 1), base.y + ((o >> 1) & 1), base.z + ((o >> 2) & 1)};
+        DeltaStore s;
+        carve(s, c);
+        int air = 0; float peak = 0.f;
+        stamp(s, keyFor(c, 1), air, peak);
+        if (o == 0) firstAir = air;
+        CHECK(air == firstAir);
+    }
+
+    // The void has to get shallower as the samples spread out, rather than
+    // being reported at full depth from one lucky voxel.
+    DeltaStore s;
+    carve(s, base);
+    float prev = kRadius + 1.f;
+    for (int lod = 1; lod <= 4; ++lod) {
+        int air = 0; float peak = 0.f;
+        stamp(s, keyFor(base, lod), air, peak);
+        CHECK(peak < prev);
+        prev = peak;
+    }
+    std::printf("    r=%.0f m crater: LOD1 air %d samples, identical across 8 lattice offsets\n", double(kRadius),
+                firstAir);
+}
+
 TEST(streaming_terraform_and_reload_are_consistent) {
     TaskSystem ts(3);
     DensityGenerator gen;

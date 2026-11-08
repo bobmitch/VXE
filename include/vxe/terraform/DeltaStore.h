@@ -117,9 +117,36 @@ public:
     // chunks (open sky) are still built once a player has added terrain there.
     bool hasEditsNear(const ChunkKey& key) const;
 
-    // Applies every override that lands on a sample of `key`'s padded field.
-    // Returns the number of samples overridden. Thread-safe (shared lock).
+    // Stamps this store's overrides into `key`'s padded field and returns the
+    // number of field samples it changed. Thread-safe (shared lock).
+    //
+    // At LOD0 this is an exact copy: one override, one sample.
+    //
+    // Above LOD0 a coarse sample stands for a block of s^3 LOD0 voxels
+    // (s = 2^lod), and taking whichever single voxel happens to sit on the
+    // lattice destroys voids: a hole is a thin negative-space feature, so
+    // point-sampling it either hits or misses, and a dug crater vanished
+    // outright by LOD3 rather than growing shallower. Each coarse sample is
+    // therefore *reduced* from the whole block it covers, centred on the sample
+    // point:
+    //
+    //   reduced = ( SUM w_i * edited_i + (s^3 - SUM w_i) * procedural ) / s^3
+    //
+    // where `procedural` is the value the generator already wrote at this
+    // sample, standing in for the voxels of the block nobody has edited. A
+    // fully edited block reduces to the mean of its edits; a lightly edited one
+    // barely moves, which is correct -- one changed voxel should not move an
+    // 8 m sample far.
+    //
+    // w_i is 1 for solid samples and `airWeight` for air ones. At 1.0 this is a
+    // plain mean, the right low-pass filter for a locally linear field and the
+    // default. Above 1.0 voids survive one coarsening further at the cost of
+    // eroding thin walls -- the knob for that trade, not a settled value.
     uint32_t applyTo(const ChunkKey& key, DensityField& field) const;
+
+    // Weight given to air samples when reducing (>= 1). See applyTo.
+    void setAirWeight(float w) { m_airWeight = w < 1.f ? 1.f : w; }
+    float airWeight() const { return m_airWeight; }
 
     std::vector<uint8_t> serialize() const;
     bool deserialize(std::span<const uint8_t> bytes);
@@ -145,6 +172,7 @@ private:
     std::unordered_map<ChunkKey, ChunkDelta, ChunkKeyHash> m_chunks;
     std::unordered_set<ChunkKey, ChunkKeyHash> m_editedNodes;   // owner chunks + all ancestors
     uint64_t m_revision = 0;
+    float m_airWeight = 1.f;                                    // see applyTo
 };
 
 } // namespace vxe

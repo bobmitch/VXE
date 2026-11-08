@@ -180,25 +180,88 @@ uint32_t DeltaStore::applyTo(const ChunkKey& key, DensityField& field) const {
 
     const Vec3i c0{floorDiv(lo.x, n), floorDiv(lo.y, n), floorDiv(lo.z, n)};
     const Vec3i c1{floorDiv(hi.x, n), floorDiv(hi.y, n), floorDiv(hi.z, n)};
-    for (int32_t cz = c0.z; cz <= c1.z; ++cz)
-        for (int32_t cy = c0.y; cy <= c1.y; ++cy)
-            for (int32_t cx = c0.x; cx <= c1.x; ++cx) {
-                auto it = m_chunks.find(ChunkKey{cx, cy, cz, 0});
-                if (it == m_chunks.end()) continue;
-                const Vec3i base{cx * n, cy * n, cz * n};
-                it->second.forEach([&](uint16_t idx, int16_t q, MaterialId m) {
-                    const Vec3i v = base + Vec3i(idx % n, (idx / n) % n, idx / (n * n));
-                    const Vec3i rel = v - lo;
-                    if (rel.x < 0 || rel.y < 0 || rel.z < 0) return;
-                    if (rel.x % s || rel.y % s || rel.z % s) return;      // not on this LOD's lattice
-                    const Vec3i si{rel.x / s, rel.y / s, rel.z / s};
-                    if (si.x >= kFieldSize || si.y >= kFieldSize || si.z >= kFieldSize) return;
-                    const size_t fi = size_t(DensityField::index(si.x, si.y, si.z));
-                    field.density[fi] = dequantizeDensity(q);
-                    field.material[fi] = m;
-                    ++applied;
-                });
+
+    // Walks every override of every edited LOD0 chunk overlapping the padded
+    // field, handing each one to `sink` as (voxel, density, material).
+    const auto forEachOverride = [&](auto&& sink) {
+        for (int32_t cz = c0.z; cz <= c1.z; ++cz)
+            for (int32_t cy = c0.y; cy <= c1.y; ++cy)
+                for (int32_t cx = c0.x; cx <= c1.x; ++cx) {
+                    auto it = m_chunks.find(ChunkKey{cx, cy, cz, 0});
+                    if (it == m_chunks.end()) continue;
+                    const Vec3i base{cx * n, cy * n, cz * n};
+                    it->second.forEach([&](uint16_t idx, int16_t q, MaterialId m) {
+                        sink(base + Vec3i(idx % n, (idx / n) % n, idx / (n * n)), dequantizeDensity(q), m);
+                    });
+                }
+    };
+
+    // ---- LOD0: one override, one sample. Exact, and must stay exact: edits
+    // are stored relative to regenerated density, so a save/load round trip has
+    // to reproduce bit-identical fields.
+    if (s == 1) {
+        forEachOverride([&](const Vec3i& v, float d, MaterialId m) {
+            const Vec3i rel = v - lo;
+            if (rel.x < 0 || rel.y < 0 || rel.z < 0) return;
+            if (rel.x >= kFieldSize || rel.y >= kFieldSize || rel.z >= kFieldSize) return;
+            const size_t fi = size_t(DensityField::index(rel.x, rel.y, rel.z));
+            field.density[fi] = d;
+            field.material[fi] = m;
+            ++applied;
+        });
+        return applied;
+    }
+
+    // ---- Coarse LODs: reduce each s^3 block onto the sample it covers.
+    struct Bin {
+        int32_t sample;        // flat index into the padded field
+        float weighted;        // SUM w_i * density_i
+        float weight;          // SUM w_i
+        int32_t count;         // edited voxels in this block, <= s^3
+        float mostSolid;       // lowest density seen, for choosing a material
+        MaterialId material;
+    };
+    std::vector<Bin> bins;
+    const float airWeight = m_airWeight;
+    const int32_t half = s / 2;
+
+    forEachOverride([&](const Vec3i& v, float d, MaterialId m) {
+        // The sample a voxel belongs to is the nearest one, so each block is
+        // centred on its sample rather than hanging off one corner.
+        const Vec3i rel = v - lo;
+        const Vec3i si{floorDiv(rel.x + half, s), floorDiv(rel.y + half, s), floorDiv(rel.z + half, s)};
+        if (si.x < 0 || si.y < 0 || si.z < 0) return;
+        if (si.x >= kFieldSize || si.y >= kFieldSize || si.z >= kFieldSize) return;
+        const float w = d >= 0.f ? airWeight : 1.f;
+        bins.push_back({DensityField::index(si.x, si.y, si.z), w * d, w, 1, d, m});
+    });
+    if (bins.empty()) return 0;
+
+    std::sort(bins.begin(), bins.end(), [](const Bin& a, const Bin& b) { return a.sample < b.sample; });
+
+    const float blockVoxels = float(s) * float(s) * float(s);
+    for (size_t i = 0; i < bins.size();) {
+        size_t j = i;
+        Bin acc = bins[i];
+        for (++j; j < bins.size() && bins[j].sample == acc.sample; ++j) {
+            acc.weighted += bins[j].weighted;
+            acc.weight += bins[j].weight;
+            acc.count += bins[j].count;
+            if (bins[j].mostSolid < acc.mostSolid) {
+                acc.mostSolid = bins[j].mostSolid;
+                acc.material = bins[j].material;
             }
+        }
+        // Voxels nobody edited keep the procedural value already in the field,
+        // at unit weight -- airWeight biases the edits, not the rock around them.
+        const size_t fi = size_t(acc.sample);
+        const float untouched = std::max(blockVoxels - float(acc.count), 0.f);
+        const float reduced = (acc.weighted + untouched * field.density[fi]) / (acc.weight + untouched);
+        field.density[fi] = std::clamp(reduced, -kDensityClamp, kDensityClamp);
+        field.material[fi] = reduced >= 0.f ? MaterialId(kMatAir) : acc.material;
+        ++applied;
+        i = j;
+    }
     return applied;
 }
 

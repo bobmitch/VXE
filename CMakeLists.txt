@@ -28,6 +28,7 @@ include(cmake/Dependencies.cmake)
 # -----------------------------------------------------------------------------
 add_library(vxe_engine STATIC
   src/core/TaskSystem.cpp
+  src/world/CaveNetwork.cpp
   src/world/DensityGenerator.cpp
   src/world/ChunkStreamer.cpp
   src/meshing/DualContouring.cpp

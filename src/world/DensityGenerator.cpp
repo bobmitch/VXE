@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #if VXE_WITH_FASTNOISE2
@@ -159,13 +161,12 @@ struct Scratch {
     std::vector<float> continental, mountainMask, ridge, hills, entrance;
     std::vector<float> height, mask01, entrance01;
     std::vector<float> gradA, gradB, gradC, gradD, heightDx, heightDz;   // stripe erosion only
-    std::vector<float> overhang, caveA, caveB, cheese;
+    std::vector<float> overhang, caveSdf;
     Scratch()
         : continental(kCols), mountainMask(kCols), ridge(kCols), hills(kCols), entrance(kCols),
           height(kCols), mask01(kCols), entrance01(kCols),
           gradA(kCols), gradB(kCols), gradC(kCols), gradD(kCols), heightDx(kCols), heightDz(kCols),
-          overhang(size_t(kFieldVolume)), caveA(size_t(kFieldVolume)), caveB(size_t(kFieldVolume)),
-          cheese(size_t(kFieldVolume)) {}
+          overhang(size_t(kFieldVolume)), caveSdf(size_t(kFieldVolume)) {}
 };
 
 Scratch& threadScratch() {
@@ -177,7 +178,7 @@ Scratch& threadScratch() {
 
 struct DensityGenerator::Impl {
     NoiseNode continental, mountainMask, ridge, hills, entrance;   // 2D
-    NoiseNode overhang, caveA, caveB, cheese;                      // 3D
+    NoiseNode overhang;                                            // 3D
 
     explicit Impl(const TerrainParams& p) {
 #if VXE_WITH_FASTNOISE2
@@ -187,9 +188,6 @@ struct DensityGenerator::Impl {
         hills        = NoiseNode(makeFbm(p.hillScale, 4), 303);
         entrance     = NoiseNode(makeFbm(400.f, 2), 404);
         overhang     = NoiseNode(makeFbm(p.overhangScale, 3), 505);
-        caveA        = NoiseNode(makeSimplex(p.spaghettiScale), 606);
-        caveB        = NoiseNode(makeSimplex(p.spaghettiScale), 707);
-        cheese       = NoiseNode(makeFbm(p.cheeseScale, 3), 808);
 #else
         continental  = NoiseNode(Kind::FBm, p.continentalScale, 5, 0);
         mountainMask = NoiseNode(Kind::FBm, p.mountainMaskScale, 3, 101);
@@ -197,9 +195,6 @@ struct DensityGenerator::Impl {
         hills        = NoiseNode(Kind::FBm, p.hillScale, 4, 303);
         entrance     = NoiseNode(Kind::FBm, 400.f, 2, 404);
         overhang     = NoiseNode(Kind::FBm, p.overhangScale, 3, 505);
-        caveA        = NoiseNode(Kind::Simplex, p.spaghettiScale, 1, 606);
-        caveB        = NoiseNode(Kind::Simplex, p.spaghettiScale, 1, 707);
-        cheese       = NoiseNode(Kind::FBm, p.cheeseScale, 3, 808);
 #endif
     }
 };
@@ -236,28 +231,17 @@ ColumnShape shapeColumn(const TerrainParams& p, float cont, float mmask, float r
 
 // Combine column shape + 3D terms into a clamped signed distance and material.
 inline void composeSample(const TerrainParams& p, const ColumnShape& col, float wy, float overhang, bool caves,
-                          float a, float b, float cheese, float caveDilation, float& outDensity, MaterialId& outMat) {
+                          float caveField, float& outDensity, MaterialId& outMat) {
     float d = wy - col.height;
     d -= overhang * lerp(p.overhangAmpPlains, p.overhangAmpMountains, col.mask);
 
     bool inCave = false;
-    // Caves only carve below the 2D surface. Besides being what we want, this
-    // makes the per-chunk "skip caves" early-out exact: a chunk that is
-    // entirely above its column heights yields identical samples either way,
-    // so shared seam samples always agree with the neighbour.
-    if (caves && wy < col.height) {
-        // Only the tunnels are widened. Cavern features run to tens of metres,
-        // so they survive coarse sampling unaided and widening them would only
-        // break the size ordering between the two.
-        const float spaghetti = (std::sqrt(a * a + b * b) - p.spaghettiRadius) * p.spaghettiScale * 0.5f - caveDilation;
-        const float cavern    = (p.cheeseThreshold - cheese) * p.cheeseScale * 0.25f;
-        // Widen before the shell and bedrock guards below, so growing a void can
-        // never punch it through the surface or the floor: those two terms still
-        // push back at full strength.
-        float caveSdf = std::min(spaghetti, cavern);                  // < 0 inside a cave
-        const float depth = col.height - wy;
-        caveSdf += std::max(0.f, p.caveSurfaceShell - depth) * (1.f - col.entrance);
-        caveSdf += std::max(0.f, (p.bedrockY + 24.f) - wy) * 2.f; // solid bedrock floor
+    // No surface shell any more. The old noise caves needed one because they
+    // surfaced at random; a placed network decides where it breaks daylight,
+    // and the throat at each entrance is meant to.
+    if (caves) {
+        float caveSdf = caveField;      // already widened for this LOD by the splat
+        caveSdf += std::max(0.f, (p.bedrockY + 24.f) - wy) * 2.f;   // solid bedrock floor
         if (-caveSdf > d) { d = -caveSdf; inCave = true; }
     }
     d = std::clamp(d, -kDensityClamp, kDensityClamp);
@@ -358,22 +342,43 @@ ChunkGenStats DensityGenerator::generate(const ChunkKey& key, DensityField& out)
     // ones cost three 3D fields to generate and are behind rock.
     const bool nearSurface = key.lod < 2 || yMax > minH - p.coarseCaveDepth;
     const bool caves = p.caves && key.lod <= p.maxCaveLod && yMin < maxH && yMax > p.bedrockY && nearSurface;
-    // How far a tunnel falls short of being sampleable at this stride, and so
-    // how much to widen it by. Zero wherever the tunnels are already wide
-    // enough, which includes the whole near field.
-    const float tunnelRadius = p.spaghettiRadius * p.spaghettiScale * 0.5f;
+    // How far a passage falls short of being sampleable at this stride, and so
+    // how much to widen it by. Zero wherever passages are already wide enough,
+    // which includes the whole near field. A placed capsule can be widened
+    // exactly; the noise fields this replaces could only be thresholded.
     const float wantedRadius = float(stride) * world::kVoxelSize * 0.5f * p.caveDilationMargin;
-    const float caveDilation = std::max(0.f, wantedRadius - tunnelRadius);
+    const float caveGrow = std::max(0.f, wantedRadius - p.cave.tunnelRadius);
     const bool overhangBand = yMax > minH - slack && yMin < maxH + slack;
 
     // ---- 3D pass (only the fields we need) --------------------------------
     if (overhangBand) m_impl->overhang.grid3D(sc.overhang.data(), x0, y0, z0, S, step, seed);
+    // Caves are splatted, not sampled: every passage near this chunk writes its
+    // own distance into the field and nothing else is touched, so a chunk with
+    // no cave in it pays for one bounds test per system rather than 38^3
+    // evaluations of anything.
+    bool anyCave = false;
     if (caves) {
-        m_impl->caveA.grid3D(sc.caveA.data(), x0, y0, z0, S, step, seed);
-        m_impl->caveB.grid3D(sc.caveB.data(), x0, y0, z0, S, step, seed);
-        m_impl->cheese.grid3D(sc.cheese.data(), x0, y0, z0, S, step, seed);
+        const Vec3f origin{x0, y0, z0};
+        const float span = float(S - 1) * step;
+        const Aabbf chunkBounds{origin, origin + Vec3f(span)};
+        // Widened by the same slack a system is allowed to stray outside its
+        // own cell, so a passage reaching in from next door is still asked for.
+        const float reach = kDensityClamp + caveGrow + p.cave.regionSize * kCellSlack;
+        const int32_t c0x = int32_t(std::floor((x0 - reach) / p.cave.regionSize));
+        const int32_t c1x = int32_t(std::floor((x0 + span + reach) / p.cave.regionSize));
+        const int32_t c0z = int32_t(std::floor((z0 - reach) / p.cave.regionSize));
+        const int32_t c1z = int32_t(std::floor((z0 + span + reach) / p.cave.regionSize));
+        for (int32_t cz = c0z; cz <= c1z; ++cz)
+            for (int32_t cx = c0x; cx <= c1x; ++cx) {
+                const CaveSystem& sysRef = cachedSystem(cx, cz);
+                if (sysRef.empty()) continue;
+                const Aabbf grown{sysRef.bounds.min - Vec3f(reach), sysRef.bounds.max + Vec3f(reach)};
+                if (!grown.intersects(chunkBounds)) continue;
+                if (!anyCave) { std::fill(sc.caveSdf.begin(), sc.caveSdf.end(), 1e30f); anyCave = true; }
+                splatCaves(sysRef, origin, step, S, caveGrow, kDensityClamp, sc.caveSdf.data());
+            }
     }
-    stats.evaluated3D = overhangBand || caves;
+    stats.evaluated3D = overhangBand || anyCave;
 
     // ---- Compose ----------------------------------------------------------
     for (int32_t z = 0; z < S; ++z) {
@@ -383,9 +388,8 @@ ChunkGenStats DensityGenerator::generate(const ChunkKey& key, DensityField& out)
                 const int32_t idx = DensityField::index(x, y, z);
                 const int32_t col = x + S * z;
                 const ColumnShape cs{sc.height[size_t(col)], sc.mask01[size_t(col)], sc.entrance01[size_t(col)]};
-                composeSample(p, cs, wy, overhangBand ? sc.overhang[size_t(idx)] : 0.f, caves,
-                              caves ? sc.caveA[size_t(idx)] : 0.f, caves ? sc.caveB[size_t(idx)] : 0.f,
-                              caves ? sc.cheese[size_t(idx)] : 0.f, caveDilation, out.density[size_t(idx)],
+                composeSample(p, cs, wy, overhangBand ? sc.overhang[size_t(idx)] : 0.f, anyCave,
+                              anyCave ? sc.caveSdf[size_t(idx)] : 1e30f, out.density[size_t(idx)],
                               out.material[size_t(idx)]);
             }
         }
@@ -404,6 +408,28 @@ SlopeXZ DensityGenerator::baseGradient(float x, float z) const {
     };
     const float h0 = h(x, z);
     return {(h(x + kGradEps, z) - h0) * (1.f / kGradEps), (h(x, z + kGradEps) - h0) * (1.f / kGradEps)};
+}
+
+// Systems are generated per region cell and cached per thread: a chunk build
+// touches a handful of cells, and the probing that finds the entrances costs
+// more than the walk that follows it. Thread-local rather than shared so the
+// workers never contend; the duplicated work across threads is small against a
+// lock on every sample.
+const CaveSystem& DensityGenerator::cachedSystem(int32_t cellX, int32_t cellZ) const {
+    struct Cache {
+        std::unordered_map<uint64_t, CaveSystem> map;
+    };
+    thread_local Cache cache;
+    const uint64_t key = (uint64_t(uint32_t(cellX)) << 32) | uint32_t(cellZ);
+    auto it = cache.map.find(key);
+    if (it != cache.map.end()) return it->second;
+    if (cache.map.size() > 512) cache.map.clear();     // bounded; cheap to rebuild
+
+    // Entrances are placed against the surface this generator actually makes,
+    // erosion included, or a cave mouth would sit in the wrong hollow.
+    const HeightFn h = [this](float wx, float wz) { return sampleHeight(wx, wz); };
+    CaveSystem sys = buildCaveSystem(m_params.cave, m_params.seed, cellX, cellZ, h);
+    return cache.map.emplace(key, std::move(sys)).first->second;
 }
 
 float DensityGenerator::sampleHeight(float x, float z) const {
@@ -430,12 +456,20 @@ float DensityGenerator::sampleDensity(const Vec3i& v) const {
     const float slack = verticalSlack();
     if (y > c.height + slack) return kDensityClamp;
     const float oh = std::abs(y - c.height) < slack ? m_impl->overhang.single3D(x, y, z, seed) : 0.f;
-    const bool caves = p.caves && y < c.height && y > p.bedrockY;
+    // LOD0 semantics: no widening, so edits and queries see the true passage.
+    float caveSdf = 1e30f;
+    if (p.caves && y > p.bedrockY) {
+        const int32_t cx = int32_t(std::floor(x / p.cave.regionSize));
+        const int32_t cz = int32_t(std::floor(z / p.cave.regionSize));
+        const int32_t r = 1 + int32_t(kCellSlack);     // matches the chunk path's widening
+        for (int32_t dz = -r; dz <= r; ++dz)
+            for (int32_t dx = -r; dx <= r; ++dx) {
+                const CaveSystem& sysRef = cachedSystem(cx + dx, cz + dz);
+                if (!sysRef.empty()) caveSdf = std::min(caveSdf, caveDistance(sysRef, {x, y, z}, 0.f));
+            }
+    }
     float d; MaterialId m;
-    // LOD0 semantics: no dilation, so edits and queries see the true cave.
-    composeSample(p, c, y, oh, caves, caves ? m_impl->caveA.single3D(x, y, z, seed) : 0.f,
-                  caves ? m_impl->caveB.single3D(x, y, z, seed) : 0.f,
-                  caves ? m_impl->cheese.single3D(x, y, z, seed) : 0.f, 0.f, d, m);
+    composeSample(p, c, y, oh, caveSdf < 1e29f, caveSdf, d, m);
     return d;
 }
 

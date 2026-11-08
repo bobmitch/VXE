@@ -7,9 +7,9 @@
 //   2D (38x38 columns, once per chunk)        3D (38^3, only where needed)
 //   ---------------------------------        --------------------------------
 //   continental FBm  --spline-->  base h      overhang FBm  (surface band only)
-//   mountain mask FBm --mask-->  ridged h     spaghetti A,B (caves, LOD <= 1)
-//   hills FBm        ---------->  detail h    cheese FBm    (caverns, LOD <= 1)
-//   cave entrance FBm
+//   mountain mask FBm --mask-->  ridged h     placed caves  (CaveNetwork, SDF
+//   hills FBm        ---------->  detail h                   splat, not noise)
+//   stripe erosion   --gullies->  eroded h
 //
 //   density = clamp( max( (y - h) - overhang, -caveSdf ), +-kDensityClamp )
 //
@@ -26,6 +26,7 @@
 // is per-thread.
 // -----------------------------------------------------------------------------
 
+#include "vxe/world/CaveNetwork.h"
 #include "vxe/world/DensityField.h"
 #include "vxe/world/StripeErosion.h"
 
@@ -45,21 +46,17 @@ struct TerrainParams {
     float overhangScale = 48.f;
     float overhangAmpPlains = 2.5f;
     float overhangAmpMountains = 14.f;
-    float spaghettiScale = 110.f;
-    float spaghettiRadius = 0.08f;     // in noise units, ~4 m tunnels
-    float cheeseScale = 220.f;
-    float cheeseThreshold = 0.55f;
-    float caveSurfaceShell = 10.f;     // metres of rock kept above caves outside entrances
     float bedrockY = -480.f;
 
-    // Caves are off. Measured, the two noise fields left about 18% of all
-    // subsurface rock hollow -- uniformly, at every depth, with 85% of columns
-    // breaching a void inside 240 m and the median one only 31 m down. That is
-    // not a tuning failure: thresholded noise is stationary, so it cannot make
-    // one place cavey and another solid (§9 of docs/world-design.md, failure
-    // 1). The underground returns as a placed network, not as a density
-    // threshold, and everything below stays for when it does.
-    bool caves = false;
+    // Where the caves themselves come from. Placed and routed by CaveNetwork,
+    // not thresholded out of noise -- see its header, and §9 of the world
+    // design doc for why the noise fields went.
+    CaveParams cave{};
+
+    // Caves. On again, but placed rather than thresholded: the noise fields
+    // this replaces left about 18% of all subsurface rock hollow, uniformly,
+    // everywhere, and could not have done otherwise (§9, failure 1).
+    bool caves = true;
 
     // Caves past this LOD are not generated at all. At 1 that was a cliff
     // rather than a fade: every cave in a whole ring of chunks existed on one
@@ -150,6 +147,10 @@ private:
     // Gradient of the unfiltered height at a fixed world-space epsilon, which
     // is what keeps the gully pattern identical at every LOD.
     SlopeXZ baseGradient(float x, float z) const;
+
+    // The cave system for one region cell, generated on first use and cached
+    // per thread. Empty for the cells that hold none, which is most of them.
+    const CaveSystem& cachedSystem(int32_t cellX, int32_t cellZ) const;
 
     struct Impl;
     TerrainParams m_params;

@@ -740,6 +740,11 @@ public:
 
     void onChunkDensityReady(const ChunkKey& key, uint32_t version,
                              const std::shared_ptr<const DensityBrick>& brick) override {
+        // One index volume, so one chunk size: a coarser brick would land in
+        // the wrong cell rather than simply miss. Levels above traceLod are
+        // dropped until the index becomes a per-level clipmap, which is why
+        // the demo wants --maxlod equal to --trace-lod.
+        if (key.lod != m_lod) return;
         if (!brick) { m_pendingRemoval.push_back(key); return; }   // uniform: nothing to trace
         m_latest[key] = version;
         m_pending.push_back({key, version, brick});
@@ -1084,6 +1089,11 @@ int main(int argc, char** argv) {
     bool startLodTint = false, startWireframe = false, startFlyby = true;
     float skirtCells = -1.f;        // < 0 = leave the StreamerConfig default alone
     bool farTrace = false;          // mesh the near field, ray march the rest
+    // Front to back by default: measured at 1.6x overdraw in hash order
+    // against ~1.0x sorted, for a sort of a few hundred entries. --no-sort is
+    // kept so the two can still be compared.
+    bool sortChunks = true;
+    bool pipeStats = false;         // count pixel shader invocations: overdraw
     int traceLod = 3;               // first LOD handed over as density instead of geometry
     bool fixedCam = false;
     double camArgs[5] = {};         // x y z yaw pitch (degrees)
@@ -1104,6 +1114,8 @@ int main(int argc, char** argv) {
         else if (a == "--free") startFlyby = false;
         else if (a == "--no-skirts") skirtCells = 0.f;
         else if (a == "--far-trace") farTrace = true;
+        else if (a == "--no-sort") sortChunks = false;
+        else if (a == "--stats") pipeStats = true;
         else if (a == "--trace-lod") traceLod = int(next(traceLod));
         else if (a == "--skirt") skirtCells = float(next(4.5));
         else if (a == "--cam") {
@@ -1114,7 +1126,8 @@ int main(int argc, char** argv) {
         else if (a == "--help" || a == "-h") {
             std::printf("usage: vxe_viewer [--view M] [--maxlod N] [--seed N] [--width N] [--height N] [--novsync]\n"
                         "                  [--free] [--cam X Y Z YAW PITCH] [--lod-tint] [--wireframe]\n"
-                        "                  [--no-skirts] [--skirt CELLS]\n"
+                        "                  [--no-skirts] [--skirt CELLS] [--no-sort] [--stats]\n"
+                        "                  [--far-trace] [--trace-lod N]   (far-trace wants --maxlod == --trace-lod)\n"
                         "                  [--screenshot FILE.png] [--screenshot-at SECONDS] [--exit-after SECONDS]\n");
             return 0;
         }
@@ -1427,6 +1440,20 @@ int main(int argc, char** argv) {
     float fovY = 1.0472f;          // 60 degrees
     const float zNear = 0.1f;
 
+    // Near-field submission list, rebuilt every frame; declared out here so the
+    // allocation happens once rather than per frame.
+    struct VisibleChunk { float dist2; const ChunkGpuRegistry::Entry* e; Vec3f rel; };
+    std::vector<VisibleChunk> visible;
+    visible.reserve(1024);
+
+    Com<ID3D11Query> statsQuery;
+    uint64_t statPixels = 0, statPrims = 0, statFrames = 0;
+    if (pipeStats) {
+        D3D11_QUERY_DESC qd{};
+        qd.Query = D3D11_QUERY_PIPELINE_STATISTICS;
+        if (FAILED(device->CreateQuery(&qd, statsQuery.put()))) return 1;
+    }
+
     printControls();
     std::printf("streaming the first ring of chunks...\n");
 
@@ -1631,11 +1658,28 @@ int main(int argc, char** argv) {
         uint32_t drawn = 0, culled = 0;
         uint64_t trianglesDrawn = 0;
         const UINT stride = sizeof(TerrainVertex), offset = 0;
+
+        // Gather first, so the submission order is a choice rather than
+        // whatever order the hash map happens to hold.
+        visible.clear();
         for (const auto& [key, e] : gpuChunks.chunks()) {
             if (!e.vb || !e.ib || e.indexCount == 0) continue;
             const Vec3f rel = Vec3f(e.origin - camera.position);
             const Aabbf camRel{e.localBounds.min + rel, e.localBounds.max + rel};
             if (!frustum.intersects(camRel)) { ++culled; continue; }
+            const Vec3f centre = (camRel.min + camRel.max) * 0.5f;
+            visible.push_back({dot(centre, centre), &e, rel});
+        }
+        // Early-Z can only reject a fragment once something nearer has been
+        // drawn, so hash order throws away most of what it could do.
+        if (sortChunks)
+            std::sort(visible.begin(), visible.end(),
+                      [](const VisibleChunk& a, const VisibleChunk& b) { return a.dist2 < b.dist2; });
+
+        if (pipeStats) ctx->Begin(statsQuery.get());
+        for (const VisibleChunk& vc : visible) {
+            const ChunkGpuRegistry::Entry& e = *vc.e;
+            const Vec3f rel = vc.rel;
 
             ChunkCB ccb{{rel.x, rel.y, rel.z}, float(e.lod)};
             D3D11_MAPPED_SUBRESOURCE map{};
@@ -1649,6 +1693,16 @@ int main(int argc, char** argv) {
             ctx->DrawIndexed(e.indexCount, 0, 0);
             ++drawn;
             trianglesDrawn += e.indexCount / 3;
+        }
+        if (pipeStats) {
+            ctx->End(statsQuery.get());
+            D3D11_QUERY_DATA_PIPELINE_STATISTICS qs{};
+            // Blocking read: this stalls the pipeline, which is exactly why it
+            // lives behind --stats and not in the normal frame.
+            while (ctx->GetData(statsQuery.get(), &qs, sizeof(qs), 0) == S_FALSE) {}
+            statPixels += qs.PSInvocations;
+            statPrims += qs.CInvocations;
+            ++statFrames;
         }
 
         // Far field, last: a fullscreen pass that only touches pixels the
@@ -1732,6 +1786,14 @@ int main(int argc, char** argv) {
     std::printf("final camera: (%.1f, %.1f, %.1f) yaw %.1f deg pitch %.1f deg, mode %s\n", camera.position.x,
                 camera.position.y, camera.position.z, camera.yaw * 57.2957795f, camera.pitch * 57.2957795f,
                 flyby ? "flyby" : "free");
+    if (pipeStats && statFrames) {
+        const double px = double(statPixels) / double(statFrames);
+        const double screen = double(g_input.width) * double(g_input.height);
+        std::printf("near field  : %.2f M pixel-shader invocations per frame over %.2f M screen pixels"
+                    " = %.2fx overdraw, %.2f M triangles rasterised, submission %s\n",
+                    px / 1e6, screen / 1e6, px / screen, double(statPrims) / double(statFrames) / 1e6,
+                    sortChunks ? "front-to-back" : "hash order");
+    }
     if (farTrace)
         std::printf("far field   : %zu bricks resident (%zu MB of a %zu MB atlas), %llu uploads over %llu frames%s\n",
                     farBricks.resident(), farBricks.usedBytes() / (1024 * 1024),

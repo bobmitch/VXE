@@ -357,7 +357,7 @@ ChunkGenStats DensityGenerator::generate(const ChunkKey& key, DensityField& out)
     // caves near enough to the surface to break through it can be seen; deep
     // ones cost three 3D fields to generate and are behind rock.
     const bool nearSurface = key.lod < 2 || yMax > minH - p.coarseCaveDepth;
-    const bool caves = key.lod <= p.maxCaveLod && yMin < maxH && yMax > p.bedrockY && nearSurface;
+    const bool caves = p.caves && key.lod <= p.maxCaveLod && yMin < maxH && yMax > p.bedrockY && nearSurface;
     // How far a tunnel falls short of being sampleable at this stride, and so
     // how much to widen it by. Zero wherever the tunnels are already wide
     // enough, which includes the whole near field.
@@ -430,7 +430,7 @@ float DensityGenerator::sampleDensity(const Vec3i& v) const {
     const float slack = verticalSlack();
     if (y > c.height + slack) return kDensityClamp;
     const float oh = std::abs(y - c.height) < slack ? m_impl->overhang.single3D(x, y, z, seed) : 0.f;
-    const bool caves = y < c.height && y > p.bedrockY;
+    const bool caves = p.caves && y < c.height && y > p.bedrockY;
     float d; MaterialId m;
     // LOD0 semantics: no dilation, so edits and queries see the true cave.
     composeSample(p, c, y, oh, caves, caves ? m_impl->caveA.single3D(x, y, z, seed) : 0.f,

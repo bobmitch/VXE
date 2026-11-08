@@ -859,6 +859,16 @@ It is also the thing to replace, and it is worth being precise about why rather 
 noise is bad. The LOD cutoff in that last row turns out not to be a cave problem at all, which is why
 it gets a subsection of its own below.
 
+**[done]** It is also switched off now. Measured, those two fields left about **18% of all
+subsurface rock hollow** — uniformly, at every depth, with 85% of columns breaching a void inside
+240 m and the median one 31 m down, which is a cellar away. For comparison, karst, the most
+cave-riddled rock there is, runs low single digits. That is not a tuning failure but failure 1
+below: thresholded noise is stationary, so it cannot make one place cavey and another solid, and no
+parameter turns 18% everywhere into 3% somewhere. Switching it off takes the demo's initial stream
+from 2.90 M triangles to 1.08 M and its resident density fields from 105 MB to 35 MB. Below 25 m the
+rock is now solid; the 3.6% of air left in the top 10 m is the overhang term, which is wanted. The
+underground comes back when there is something to *place*, not a threshold to cross.
+
 ### §1 is a surface rule, and always was
 
 §1 places biomes and fixes what the world looks like from outside — continuous land and water, a

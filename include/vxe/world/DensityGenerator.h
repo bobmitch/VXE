@@ -52,6 +52,15 @@ struct TerrainParams {
     float caveSurfaceShell = 10.f;     // metres of rock kept above caves outside entrances
     float bedrockY = -480.f;
 
+    // Caves are off. Measured, the two noise fields left about 18% of all
+    // subsurface rock hollow -- uniformly, at every depth, with 85% of columns
+    // breaching a void inside 240 m and the median one only 31 m down. That is
+    // not a tuning failure: thresholded noise is stationary, so it cannot make
+    // one place cavey and another solid (§9 of docs/world-design.md, failure
+    // 1). The underground returns as a placed network, not as a density
+    // threshold, and everything below stays for when it does.
+    bool caves = false;
+
     // Caves past this LOD are not generated at all. At 1 that was a cliff
     // rather than a fade: every cave in a whole ring of chunks existed on one
     // side of the LOD1/LOD2 boundary and not on the other, and the ring swept

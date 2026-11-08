@@ -310,7 +310,12 @@ float4 PSSky(SkyOut i) : SV_Target
 // sizeof(kShaderSource) still spans both.
 R"HLSL(
 // ---- On-screen overlay ------------------------------------------------------
-cbuffer Overlay : register(b3) { float4 gOverlayRect; };   // x0, y0, x1, y1 in NDC
+cbuffer Overlay : register(b3)
+{
+    float4 gOverlayRect;    // x0, y0, x1, y1 in NDC
+    float4 gBeacon;         // xyz = mouth, camera-relative;  w = height in metres
+    float4 gBeaconTint;     // rgb, a = overall alpha
+};
 Texture2D    gOverlayTex : register(t2);
 SamplerState gOverlaySmp : register(s1);
 
@@ -334,6 +339,37 @@ float4 PSOverlay(OverlayOut i) : SV_Target
     return float4(col, max(a, 0.62));
 }
 
+// ---- Cave entrance beacon ---------------------------------------------------
+// Two crossed vertical quads over a cave mouth, drawn without depth so it shows
+// through the hill in front of it. A debug aid and nothing else: the whole
+// question it exists to answer is whether an entrance can be found *without*
+// one, so it has to be easy to switch off.
+struct BeaconOut { float4 clip : SV_Position; float h : TEXCOORD0; };
+
+BeaconOut VSBeacon(uint vid : SV_VertexID)
+{
+    const uint q = vid / 6u, c = vid % 6u;
+    const float2 uv = float2((c == 1u || c == 4u || c == 5u) ? 1.0 : 0.0,
+                             (c == 2u || c == 3u || c == 5u) ? 1.0 : 0.0);
+    const float w = 1.6;
+    const float3 offs = (q == 0u) ? float3((uv.x - 0.5) * w, uv.y * gBeacon.w, 0.0)
+                                  : float3(0.0, uv.y * gBeacon.w, (uv.x - 0.5) * w);
+    BeaconOut o;
+    o.h = uv.y;
+    o.clip = mul(float4(gBeacon.xyz + offs, 1.0), gViewProj);
+    return o;
+}
+
+float4 PSBeacon(BeaconOut i) : SV_Target
+{
+    // Brightest at the ground, so the eye is led to the mouth and not the sky.
+    const float a = gBeaconTint.a * (1.0 - i.h) * (1.0 - i.h);
+    return float4(gBeaconTint.rgb * a, a);
+}
+
+)HLSL"
+// Third literal, same 16380-byte cap as the first split.
+R"HLSL(
 // -----------------------------------------------------------------------------
 // Tessellation: VS -> HS -> DS -> PS, adding micro-relief close to the camera.
 //
@@ -1151,7 +1187,7 @@ struct ChunkCB {
 };
 static_assert(sizeof(ChunkCB) % 16 == 0);
 
-struct OverlayCB { float rect[4]; };
+struct OverlayCB { float rect[4]; float beacon[4]; float tint[4]; };
 static_assert(sizeof(OverlayCB) % 16 == 0);
 
 struct FarCB {
@@ -1335,6 +1371,7 @@ void printControls() {
         "  F            toggle cinematic flyby / free camera\n"
         "  V            toggle walking: eyes 2 m above the ground, no flying\n"
         "  T            toggle tessellation (only with --tess)\n"
+        "  K            show / hide the markers over cave entrances\n"
         "  click / Tab  capture the mouse (free look).  Tab or Esc releases it\n"
         "  W A S D      move,  Q / E  down / up\n"
         "  Shift        x8 speed,  Ctrl  x1/5 speed,  mouse wheel  set base speed\n"
@@ -1558,6 +1595,13 @@ int main(int argc, char** argv) {
     if (!compile("VSOverlay", "vs_5_0", ovVsBlob) || !compile("PSOverlay", "ps_5_0", ovPsBlob)) return 1;
     device->CreateVertexShader(ovVsBlob->GetBufferPointer(), ovVsBlob->GetBufferSize(), nullptr, ovVs.put());
     device->CreatePixelShader(ovPsBlob->GetBufferPointer(), ovPsBlob->GetBufferSize(), nullptr, ovPs.put());
+
+    Com<ID3DBlob> bcVsBlob, bcPsBlob;
+    Com<ID3D11VertexShader> bcVs;
+    Com<ID3D11PixelShader> bcPs;
+    if (!compile("VSBeacon", "vs_5_0", bcVsBlob) || !compile("PSBeacon", "ps_5_0", bcPsBlob)) return 1;
+    device->CreateVertexShader(bcVsBlob->GetBufferPointer(), bcVsBlob->GetBufferSize(), nullptr, bcVs.put());
+    device->CreatePixelShader(bcPsBlob->GetBufferPointer(), bcPsBlob->GetBufferSize(), nullptr, bcPs.put());
 
     Com<ID3D11BlendState> blendAlpha;
     {
@@ -1793,6 +1837,9 @@ int main(int argc, char** argv) {
     bool tessOn = tess;            // T toggles it, when --tess built the shaders
     bool walkSnap = walk;          // first frame in walk mode places the feet rather than easing
     float digRadius = digRadiusStart;
+    bool showBeacons = true;              // K: debug markers over cave mouths
+    std::vector<Vec3f> caveMouths;
+    double beaconRefresh = 1e9;           // seconds since the list was rebuilt
     TextOverlay overlay(device.get());
     bool showOverlay = true;
     bool overlayDirty = true;
@@ -1871,6 +1918,10 @@ int main(int argc, char** argv) {
         if (g_input.takePress('L')) lodTint = !lodTint;
         if (g_input.takePress('C')) cullBackfaces = !cullBackfaces;
         if (g_input.takePress('H')) showOverlay = !showOverlay;
+        if (g_input.takePress('K')) {
+            showBeacons = !showBeacons;
+            std::printf("cave markers: %s\n", showBeacons ? "on" : "off");
+        }
         if (g_input.takePress('V')) {
             walk = !walk;
             if (walk) { flyby = false; walkSnap = true; }
@@ -2185,6 +2236,41 @@ int main(int argc, char** argv) {
             FarFieldBricks::unbind(ctx.get());
         }
 
+        // Cave mouth markers, before the overlay so the panel stays on top.
+        if (showBeacons) {
+            beaconRefresh += double(dt);
+            if (beaconRefresh > 0.5) {     // the list only changes as you travel
+                beaconRefresh = 0.0;
+                generator.caveEntrancesNear(camera.position, 700.f, caveMouths);
+            }
+            if (!caveMouths.empty()) {
+                ctx->IASetInputLayout(nullptr);
+                ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx->HSSetShader(nullptr, nullptr, 0);
+                ctx->DSSetShader(nullptr, nullptr, 0);
+                ctx->OMSetDepthStencilState(dssSky.get(), 0);      // through terrain: that is the point
+                ctx->OMSetBlendState(blendAlpha.get(), nullptr, 0xFFFFFFFF);
+                ctx->RSSetState(rsNoCull.get());
+                ctx->VSSetShader(bcVs.get(), nullptr, 0);
+                ctx->PSSetShader(bcPs.get(), nullptr, 0);
+                ID3D11Buffer* bcbs[] = {overlayCB.get()};
+                ctx->VSSetConstantBuffers(3, 1, bcbs);
+                ctx->PSSetConstantBuffers(3, 1, bcbs);
+                for (const Vec3f& m : caveMouths) {
+                    const Vec3f rel = Vec3f(Vec3d(m) - camera.position);
+                    OverlayCB bcb{};
+                    bcb.beacon[0] = rel.x; bcb.beacon[1] = rel.y; bcb.beacon[2] = rel.z; bcb.beacon[3] = 70.f;
+                    bcb.tint[0] = 0.25f; bcb.tint[1] = 1.0f; bcb.tint[2] = 0.55f; bcb.tint[3] = 0.75f;
+                    D3D11_MAPPED_SUBRESOURCE bm{};
+                    ctx->Map(overlayCB.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &bm);
+                    std::memcpy(bm.pData, &bcb, sizeof(bcb));
+                    ctx->Unmap(overlayCB.get(), 0);
+                    ctx->Draw(12, 0);
+                }
+                ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+            }
+        }
+
         // Overlay last, over everything, alpha blended.
         if (showOverlay) {
             if (overlayDirty || !overlay.srv()) {
@@ -2200,7 +2286,8 @@ int main(int argc, char** argv) {
                               "V   walk / free-cam        F   cinematic flyby\n"
                               "G   wireframe              L   LOD colour tint\n"
                               "C   backface culling       R   respawn\n"
-                              "T   tessellation           [ / ]  flyby speed",
+                              "T   tessellation           K   cave entrance markers\n"
+                              "[ / ]  flyby speed",
                               double(digRadius));
                 overlay.build(buf, 520, 17);
                 overlayDirty = false;
@@ -2261,16 +2348,33 @@ int main(int argc, char** argv) {
         if (titleTimer > 0.2) {
             titleTimer = 0.0;
             const auto& s = streamer.stats();
+            // Nearest cave mouth, so there is something to walk toward before a
+            // marker is anywhere in view.
+            char cave[96] = "";
+            if (!caveMouths.empty()) {
+                double bestD2 = 1e30;
+                const Vec3f* best = nullptr;
+                for (const Vec3f& m : caveMouths) {
+                    const double dx = double(m.x) - camera.position.x, dz = double(m.z) - camera.position.z;
+                    if (dx * dx + dz * dz < bestD2) { bestD2 = dx * dx + dz * dz; best = &m; }
+                }
+                const double dx = double(best->x) - camera.position.x, dz = double(best->z) - camera.position.z;
+                static const char* kPoints[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+                // Yaw 0 looks down +Z, so +Z is north as far as this is concerned.
+                const double ang = std::atan2(dx, dz) * (180.0 / 3.14159265358979);
+                const int oct = int(std::floor((ang < 0.0 ? ang + 360.0 : ang) / 45.0 + 0.5)) & 7;
+                std::snprintf(cave, sizeof(cave), " | cave %.0f m %s", std::sqrt(bestD2), kPoints[oct]);
+            }
             char buf[512];
             std::snprintf(buf, sizeof(buf),
                           "VXE viewer | %s | %.1f fps (%.1f ms) | pos %.0f %.0f %.0f | chunks %u res / %u drawn / %u culled"
-                          " | %.2f M tris | building %u, queued %zu%s%s",
+                          " | %.2f M tris%s | building %u, queued %zu%s%s",
                           flyby  ? "FLYBY (F for free-cam)"
                           : walk ? "WALK 2 m (V for free-cam, Tab for mouse)"
                                  : "FREE-CAM (V to walk, F for flyby, Tab for mouse)",
                           frameMsAvg > 0.0 ? 1000.0 / frameMsAvg : 0.0, frameMsAvg, camera.position.x, camera.position.y,
                           camera.position.z, s.residentChunks, drawn, culled, double(trianglesDrawn) / 1e6,
-                          s.buildingChunks, gpuChunks.pendingUploads(), wireframe ? " | wire" : "",
+                          cave, s.buildingChunks, gpuChunks.pendingUploads(), wireframe ? " | wire" : "",
                           lodTint ? " | lod-tint" : "");
             title = buf;
             SetWindowTextA(g_hwnd, title.c_str());

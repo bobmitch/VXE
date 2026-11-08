@@ -138,6 +138,11 @@ public:
     // Conservative height bounds over an XZ rectangle (for streaming culling).
     HeightRange columnRange(float x0, float z0, float x1, float z1) const;
 
+    // Cave mouths within `radius` of a point, world space. For anything that
+    // needs to know where a way in is -- a debug marker now, reconnaissance or
+    // spawn placement later -- without walking the passages behind them.
+    void caveEntrancesNear(const Vec3d& centre, float radius, std::vector<Vec3f>& out) const;
+
     const TerrainParams& params() const { return m_params; }
     // Max vertical displacement 3D noise can add above/below the 2D height.
     float verticalSlack() const;

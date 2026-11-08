@@ -95,6 +95,10 @@ struct CaveChamber {
 struct CaveSystem {
     std::vector<CaveSegment> segments;
     std::vector<CaveChamber> chambers;
+    // The mouths, kept separately: they are the only part of a system the
+    // surface can see, so anything asking "is there a way in near here" wants
+    // these rather than the 200 passages behind them.
+    std::vector<Vec3f> entrances;
     Aabbf bounds{Vec3f(1e30f), Vec3f(-1e30f)};
     bool empty() const { return segments.empty() && chambers.empty(); }
 };

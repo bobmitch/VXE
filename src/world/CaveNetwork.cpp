@@ -175,6 +175,7 @@ CaveSystem buildCaveSystem(const CaveParams& p, int32_t seed, int32_t cellX, int
 
         CaveSegment throat{mouth, inside, p.tunnelRadius * 0.85f, p.tunnelRadius};
         sys.segments.push_back(throat);
+        sys.entrances.push_back(mouth);
         growBounds(sys.bounds, mouth, p.tunnelRadius);
         growBounds(sys.bounds, inside, p.tunnelRadius);
 

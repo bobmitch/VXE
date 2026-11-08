@@ -432,6 +432,23 @@ const CaveSystem& DensityGenerator::cachedSystem(int32_t cellX, int32_t cellZ) c
     return cache.map.emplace(key, std::move(sys)).first->second;
 }
 
+void DensityGenerator::caveEntrancesNear(const Vec3d& centre, float radius, std::vector<Vec3f>& out) const {
+    out.clear();
+    if (!m_params.caves) return;
+    const float cell = m_params.cave.regionSize;
+    const float reach = radius + cell * kCellSlack;
+    const int32_t c0x = int32_t(std::floor((centre.x - reach) / double(cell)));
+    const int32_t c1x = int32_t(std::floor((centre.x + reach) / double(cell)));
+    const int32_t c0z = int32_t(std::floor((centre.z - reach) / double(cell)));
+    const int32_t c1z = int32_t(std::floor((centre.z + reach) / double(cell)));
+    for (int32_t cz = c0z; cz <= c1z; ++cz)
+        for (int32_t cx = c0x; cx <= c1x; ++cx)
+            for (const Vec3f& e : cachedSystem(cx, cz).entrances) {
+                const double dx = double(e.x) - centre.x, dz = double(e.z) - centre.z;
+                if (dx * dx + dz * dz <= double(radius) * double(radius)) out.push_back(e);
+            }
+}
+
 float DensityGenerator::sampleHeight(float x, float z) const {
     const int seed = m_params.seed;
     const ColumnShape c = shapeColumn(m_params, m_impl->continental.single2D(x, z, seed),

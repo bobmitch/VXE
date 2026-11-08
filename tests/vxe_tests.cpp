@@ -554,6 +554,72 @@ TEST(streaming_terraform_and_reload_are_consistent) {
     CHECK(q2.density(hole) > 0.f);
 }
 
+TEST(lod_selection_does_not_flip_flop_on_the_boundary) {
+    // Split used to be a step function of distance, so a camera loitering on a
+    // boundary re-split and re-merged the same subtree every frame and one
+    // patch of ground popped between two LODs. Hysteresis makes the boundary
+    // sticky; this asserts that loitering inside the band costs nothing, and
+    // that without the band it still costs something, so the test keeps biting.
+    DensityGenerator gen;
+    DeltaStore deltas;
+    const double height = double(gen.sampleHeight(0.f, 0.f)) + 20.0;
+
+    // Walks out from the origin looking for a step that *merges* LOD0 away.
+    // Counting rebuilds instead would fire on the first step, because moving at
+    // all pulls new coarse chunks over the view horizon; a drop in the finest
+    // level only happens when a subtree actually collapses.
+    auto findBoundary = [&](ChunkStreamer& s) {
+        pumpUntilIdle(s, {0.0, height, 0.0});
+        uint32_t prevFine = s.stats().perLod[0];
+        for (double x = 5.0; x < 300.0; x += 5.0) {
+            pumpUntilIdle(s, {x, height, 0.0});
+            const uint32_t fine = s.stats().perLod[0];
+            if (fine < prevFine) return x;
+            prevFine = fine;
+        }
+        return -1.0;
+    };
+    // Rocks back and forth across the boundary and reports what the churn cost.
+    // The sweep has to be wider than the 5 m search step, so that it genuinely
+    // straddles the threshold, and narrower than the 15% band, so that
+    // hysteresis can hold it: at LOD1 that band is ~19 m, so +-5 m sits inside.
+    auto churnAcross = [&](ChunkStreamer& s, double boundary, int crossings) {
+        pumpUntilIdle(s, {boundary - 5.0, height, 0.0});     // prime: one-time work here
+        pumpUntilIdle(s, {boundary + 5.0, height, 0.0});
+        const uint64_t before = s.stats().chunksBuilt;
+        for (int i = 0; i < crossings; ++i) {
+            pumpUntilIdle(s, {boundary - 5.0, height, 0.0});
+            pumpUntilIdle(s, {boundary + 5.0, height, 0.0});
+        }
+        return s.stats().chunksBuilt - before;
+    };
+
+    StreamerConfig cfg;
+    cfg.maxLod = 2;
+    cfg.viewDistance = 400.0;
+
+    TaskSystem ts(3);
+    ChunkStreamer sticky(ts, gen, deltas, cfg);
+    const double boundary = findBoundary(sticky);
+    CHECK(boundary > 0.0);
+    const uint64_t stickyChurn = churnAcross(sticky, boundary, 6);
+
+    // Same walk with the hysteresis band removed, as a control.
+    StreamerConfig stepCfg = cfg;
+    stepCfg.splitHysteresis = 1.0;
+    ChunkStreamer stepped(ts, gen, deltas, stepCfg);
+    const double stepBoundary = findBoundary(stepped);
+    const uint64_t steppedChurn = stepBoundary > 0.0 ? churnAcross(stepped, stepBoundary, 6) : 0;
+
+    std::printf("    boundary x=%.0f m, 12 crossings: %llu chunks rebuilt with hysteresis, %llu without\n", boundary,
+                (unsigned long long)stickyChurn, (unsigned long long)steppedChurn);
+    CHECK(steppedChurn > 0);                      // the control still reproduces the churn
+    CHECK(steppedChurn > 5 * stickyChurn);
+    // Not zero, and should not be asserted as zero: rocking 10 m also carries
+    // chunks over the 400 m view horizon and back, which is real work and has
+    // nothing to do with the split threshold. The ratio is the signal.
+}
+
 TEST(structure_graph_support_propagation) {
     StructureGraph g;
     // Wood column: grounded base + 9 stacked pieces. 100 - 12.5 * k

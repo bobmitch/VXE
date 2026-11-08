@@ -63,6 +63,7 @@ bool ChunkStreamer::isIdle() const {
 // Selection
 // ---------------------------------------------------------------------------
 void ChunkStreamer::computeDesired(const Vec3d& focus) {
+    m_previousDesired.swap(m_desiredNodes);     // last frame's split decisions, for hysteresis
     m_desiredNodes.clear();
     for (auto& [k, r] : m_records) r.desired = false;
 
@@ -84,7 +85,14 @@ void ChunkStreamer::visitNode(const ChunkKey& key, const Vec3d& focus) {
     const double dist = b.distanceTo(focus);
     if (dist > m_config.viewDistance) return;
 
-    if (key.lod > 0 && dist < m_config.splitFactor * chunkSizeMetres(key.lod)) {
+    // Hysteresis: a node already split last frame holds on until the camera
+    // pulls back past the wider threshold, so the boundary is sticky rather
+    // than a step and a camera sitting on it stops rebuilding the subtree.
+    double splitWithin = m_config.splitFactor * chunkSizeMetres(key.lod);
+    if (const auto prev = m_previousDesired.find(key); prev != m_previousDesired.end() && !prev->second)
+        splitWithin *= m_config.splitHysteresis;
+
+    if (key.lod > 0 && dist < splitWithin) {
         m_desiredNodes[key] = false;
         for (int i = 0; i < 8; ++i) visitNode(key.child(i), focus);
         return;

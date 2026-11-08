@@ -44,6 +44,14 @@ struct StreamerConfig {
     uint8_t maxLod = 5;                 // 1024 m top-level chunks
     double viewDistance = 4096.0;       // metres
     double splitFactor = 2.0;           // split while dist < factor * chunkSize
+    // Hysteresis on that threshold. A single threshold makes the split decision
+    // a step function of distance, so a camera loitering on the boundary -- or
+    // merely breathing across it, since `dist` is to the chunk AABB -- rebuilds
+    // the same subtree every frame and the player watches one patch of ground
+    // pop between two LODs. Once split, a node stays split until the camera
+    // pulls back past splitFactor * chunkSize * this. It costs a band of chunks
+    // held one level finer than strictly needed; 1.0 restores the old step.
+    double splitHysteresis = 1.15;
     double deepCullMargin = 96.0;       // LOD>0 chunks this far below the surface envelope are skipped
     uint32_t maxJobsInFlight = 48;
     uint32_t maxDispatchPerUpdate = 24;
@@ -159,7 +167,9 @@ private:
 
     std::unordered_map<ChunkKey, Record, ChunkKeyHash> m_records;
     // Desired octree nodes of the current frame: true = leaf, false = split.
+    // key -> was a desired leaf (true) or split into children (false).
     std::unordered_map<ChunkKey, bool, ChunkKeyHash> m_desiredNodes;
+    std::unordered_map<ChunkKey, bool, ChunkKeyHash> m_previousDesired;   // last frame's, for hysteresis
     // XZ column envelope cache, keyed by (x, 0, z, lod).
     std::unordered_map<ChunkKey, HeightRange, ChunkKeyHash> m_columnCache;
 

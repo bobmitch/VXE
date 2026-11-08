@@ -1198,6 +1198,8 @@ void printControls() {
         "\ncontrols\n"
         "--------\n"
         "  F            toggle cinematic flyby / free camera\n"
+        "  V            toggle walking: eyes 2 m above the ground, no flying\n"
+        "  T            toggle tessellation (only with --tess)\n"
         "  click / Tab  capture the mouse (free look).  Tab or Esc releases it\n"
         "  W A S D      move,  Q / E  down / up\n"
         "  Shift        x8 speed,  Ctrl  x1/5 speed,  mouse wheel  set base speed\n"
@@ -1229,6 +1231,8 @@ int main(int argc, char** argv) {
     bool pipeStats = false;         // count pixel shader invocations: overdraw
     bool stripes = false;           // gradient-aligned stripe erosion on the heights
     float stripeAmp = 5.f, stripeWidth = 60.f;
+    bool walk = false;              // first-person: eye height above the ground, no flying
+    float eyeHeight = 2.f, walkSpeed = 4.5f;
     bool tess = false;              // hardware tessellation + micro-relief up close
     float dispAmp = 0.45f;          // metres; kept under step height, see below
     float dispFar = 90.f, tessTargetPx = 14.f, tessMax = 7.f;
@@ -1254,6 +1258,9 @@ int main(int argc, char** argv) {
         else if (a == "--far-trace") farTrace = true;
         else if (a == "--no-sort") sortChunks = false;
         else if (a == "--stripes") stripes = true;
+        else if (a == "--walk") { walk = true; startFlyby = false; }
+        else if (a == "--eye") eyeHeight = float(next(eyeHeight));
+        else if (a == "--walk-speed") walkSpeed = float(next(walkSpeed));
         else if (a == "--tess") tess = true;
         else if (a == "--disp-amp") dispAmp = float(next(dispAmp));
         else if (a == "--disp-far") dispFar = float(next(dispFar));
@@ -1607,6 +1614,7 @@ int main(int argc, char** argv) {
     bool lodTint = startLodTint;
     bool cullBackfaces = true;
     bool tessOn = tess;            // T toggles it, when --tess built the shaders
+    bool walkSnap = walk;          // first frame in walk mode places the feet rather than easing
     double flyDistance = 0.0;
     double flySpeed = 55.0;        // metres/second along the loop
     float freeSpeed = 40.f;        // metres/second
@@ -1681,6 +1689,11 @@ int main(int argc, char** argv) {
         if (g_input.takePress('G')) wireframe = !wireframe;
         if (g_input.takePress('L')) lodTint = !lodTint;
         if (g_input.takePress('C')) cullBackfaces = !cullBackfaces;
+        if (g_input.takePress('V')) {
+            walk = !walk;
+            if (walk) { flyby = false; walkSnap = true; }
+            std::printf("camera     : %s\n", walk ? "walking, eyes at 2 m" : "free-cam");
+        }
         if (g_input.takePress('T') && tess) {
             tessOn = !tessOn;
             std::printf("tessellation: %s\n", tessOn ? "on" : "off");
@@ -1723,18 +1736,46 @@ int main(int argc, char** argv) {
                 camera.pitch -= float(g_input.mouseDy) * kSensitivity;
                 camera.pitch = std::clamp(camera.pitch, -1.553f, 1.553f);   // just shy of straight up/down
             }
-            float speed = freeSpeed;
-            if (g_input.keys[VK_SHIFT]) speed *= 8.f;
-            if (g_input.keys[VK_CONTROL]) speed *= 0.2f;
-            const Vec3f f = camera.forward(), r = camera.right();
+            // Walking: move in the horizontal plane whatever the view is doing,
+            // and let the ground decide the height. Looking down must not walk
+            // you into the dirt, which is the whole difference from free-cam.
+            float speed = walk ? walkSpeed : freeSpeed;
+            if (g_input.keys[VK_SHIFT]) speed *= walk ? 2.4f : 8.f;
+            if (g_input.keys[VK_CONTROL]) speed *= walk ? 0.4f : 0.2f;
+            Vec3f f = camera.forward(), r = camera.right();
+            if (walk) {
+                f.y = 0.f; r.y = 0.f;
+                if (dot(f, f) > 1e-6f) f = normalize(f);
+                if (dot(r, r) > 1e-6f) r = normalize(r);
+            }
             Vec3f move{};
             if (g_input.keys['W']) move += f;
             if (g_input.keys['S']) move -= f;
             if (g_input.keys['D']) move += r;
             if (g_input.keys['A']) move -= r;
-            if (g_input.keys['E']) move.y += 1.f;
-            if (g_input.keys['Q']) move.y -= 1.f;
+            if (!walk) {
+                if (g_input.keys['E']) move.y += 1.f;
+                if (g_input.keys['Q']) move.y -= 1.f;
+            }
             if (dot(move, move) > 1e-6f) camera.position += Vec3d(normalize(move) * (speed * dt));
+
+            if (walk) {
+                // Entering walk mode from anywhere -- a flyby at altitude, say
+                // -- the feet have to be put on the ground before a short probe
+                // can find it, so the column height does the placing once.
+                if (walkSnap) {
+                    camera.position.y = double(generator.sampleHeight(float(camera.position.x),
+                                                                      float(camera.position.z))) + double(eyeHeight);
+                    walkSnap = false;
+                }
+                // Then a raycast each frame, rather than the column height,
+                // because that one follows overhangs and anything dug since.
+                const Vec3d probe{camera.position.x, camera.position.y + 3.0, camera.position.z};
+                if (const auto hit = terrainQuery.raycast(probe, Vec3f{0.f, -1.f, 0.f}, 120.f)) {
+                    const double target = probe.y - double(*hit) + double(eyeHeight);
+                    camera.position.y += (target - camera.position.y) * (1.0 - std::exp(-14.0 * double(dt)));
+                }
+            }
             camera.position.y = std::clamp(camera.position.y, double(world::kWorldMinY) + 2.0, double(world::kWorldMaxY) - 2.0);
             const double limit = double(world::kWorldHalfExtentXZ) - 64.0;
             camera.position.x = std::clamp(camera.position.x, -limit, limit);
@@ -1972,7 +2013,9 @@ int main(int argc, char** argv) {
             std::snprintf(buf, sizeof(buf),
                           "VXE viewer | %s | %.1f fps (%.1f ms) | pos %.0f %.0f %.0f | chunks %u res / %u drawn / %u culled"
                           " | %.2f M tris | building %u, queued %zu%s%s",
-                          flyby ? "FLYBY (F for free-cam)" : "FREE-CAM (F for flyby, Tab for mouse)",
+                          flyby  ? "FLYBY (F for free-cam)"
+                          : walk ? "WALK 2 m (V for free-cam, Tab for mouse)"
+                                 : "FREE-CAM (V to walk, F for flyby, Tab for mouse)",
                           frameMsAvg > 0.0 ? 1000.0 / frameMsAvg : 0.0, frameMsAvg, camera.position.x, camera.position.y,
                           camera.position.z, s.residentChunks, drawn, culled, double(trianglesDrawn) / 1e6,
                           s.buildingChunks, gpuChunks.pendingUploads(), wireframe ? " | wire" : "",
@@ -1987,7 +2030,7 @@ int main(int argc, char** argv) {
                 (unsigned long long)tasks.tasksExecuted());
     std::printf("final camera: (%.1f, %.1f, %.1f) yaw %.1f deg pitch %.1f deg, mode %s\n", camera.position.x,
                 camera.position.y, camera.position.z, camera.yaw * 57.2957795f, camera.pitch * 57.2957795f,
-                flyby ? "flyby" : "free");
+                flyby ? "flyby" : (walk ? "walk" : "free"));
     if (pipeStats && statFrames) {
         const double px = double(statPixels) / double(statFrames);
         const double screen = double(g_input.width) * double(g_input.height);

@@ -171,12 +171,18 @@ cbuffer Frame : register(b0)
     float3 gCamUp;      float gPad1;
     float3 gCamFwd;     float gPad2;
     float4 gMaterial[8];   // rgb = base colour, a = roughness (unused by this path)
+    float  gTessTargetPx;  float gPixPerRadian;   // tessellation: target edge size, px per radian
+    float  gDispFar;       float gDispFade;       // displacement fades out over this band
+    float  gDispAmp;       float gTessMax;
+    float  gPad3;          float gPad4;
 };
 
 cbuffer Chunk : register(b1)
 {
     float3 gChunkOffset;   // chunk origin - camera position, double-differenced on the CPU
     float  gChunkLod;
+    float3 gChunkWorld;    // chunk origin in world space: displacement must be a
+    float  gChunkPad;      // function of world position, not of the camera
 };
 
 struct VSIn {
@@ -297,6 +303,126 @@ float4 PSSky(SkyOut i) : SV_Target
     const float3 dir = normalize(gCamFwd + gCamRight * (i.ndc.x * gTanHalfFovX) +
                                            gCamUp    * (i.ndc.y * gTanHalfFovY));
     return float4(pow(saturate(skyColor(dir)), 1.0 / 2.2), 1.0);
+}
+)HLSL"
+// MSVC caps one string literal at 16380 bytes, so the source carries on in a
+// second adjacent literal. They concatenate into a single array, so
+// sizeof(kShaderSource) still spans both.
+R"HLSL(
+// -----------------------------------------------------------------------------
+// Tessellation: VS -> HS -> DS -> PS, adding micro-relief close to the camera.
+//
+// Crack-free by construction. A tessellation factor is computed from the edge's
+// own two endpoints, so the two triangles sharing an edge always arrive at the
+// same number and fractional_odd partitioning then splits it identically from
+// both sides -- no negotiation between patches, and none between chunks either,
+// since the endpoints are the same world positions whoever asks.
+//
+// The displacement is a pure function of world position for the same reason. It
+// fades to zero over a band before it stops being applied, so the join against
+// untessellated geometry further out has nothing to crack along.
+//
+// Simplified against shaders/Displacement.hlsli, which is the real definition
+// and wants the material table and triplanar height maps this classic path does
+// not carry. The structure is the same: relief per material, faded by distance.
+// -----------------------------------------------------------------------------
+struct CtrlPoint {
+    float3 camRel : TEXCOORD0;
+    float3 nrm    : TEXCOORD1;
+    float3 albedo : TEXCOORD2;
+    float  ao     : TEXCOORD3;
+    float3 world  : TEXCOORD4;
+};
+
+CtrlPoint VSTess(VSIn i)
+{
+    CtrlPoint o;
+    o.camRel = i.pos + gChunkOffset;
+    o.world  = i.pos + gChunkWorld;
+    o.nrm    = i.nrm;
+    const uint  primary   = i.mat & 0xFFu;
+    const uint  secondary = (i.mat >> 8) & 0xFFu;
+    const float blend     = float((i.mat >> 16) & 0xFFu) * (1.0 / 255.0);
+    o.ao                  = float((i.mat >> 24) & 0xFFu) * (1.0 / 255.0);
+    float3 albedo = lerp(gMaterial[min(primary, 7u)].rgb, gMaterial[min(secondary, 7u)].rgb, blend);
+    o.albedo = lerp(albedo, kLodTint[min(uint(gChunkLod), 6u)], gLodTint);
+    return o;
+}
+
+float dispFadeAt(float dist)
+{
+    return 1.0 - saturate((dist - gDispFar) / max(gDispFade, 1e-3));
+}
+
+// Micro-relief in metres, before amplitude. Steep faces get more of it than
+// ground you are meant to walk on.
+float microRelief(float3 wp, float3 n)
+{
+    float h = (valueNoise(wp * 0.6) - 0.5) + (valueNoise(wp * 1.9) - 0.5) * 0.45;
+    const float steep = 1.0 - saturate(n.y);
+    return h * (0.5 + 0.9 * steep);
+}
+
+struct PatchConst { float edges[3] : SV_TessFactor; float inside : SV_InsideTessFactor; };
+
+float edgeTess(float3 a, float3 b)
+{
+    const float3 mid = 0.5 * (a + b);
+    const float d = max(length(mid), 0.5);
+    if (d > gDispFar + gDispFade) return 1.0;        // nothing to add this far out
+    // How long this edge is on screen, against the edge size we are aiming for.
+    const float px = length(a - b) * gPixPerRadian / d;
+    return clamp(px / max(gTessTargetPx, 1.0), 1.0, gTessMax);
+}
+
+PatchConst HSConst(InputPatch<CtrlPoint, 3> p)
+{
+    PatchConst o;
+    // SV_TessFactor[i] is the edge opposite control point i.
+    o.edges[0] = edgeTess(p[1].camRel, p[2].camRel);
+    o.edges[1] = edgeTess(p[2].camRel, p[0].camRel);
+    o.edges[2] = edgeTess(p[0].camRel, p[1].camRel);
+    o.inside = max(o.edges[0], max(o.edges[1], o.edges[2]));
+    return o;
+}
+
+[domain("tri")]
+[partitioning("fractional_odd")]
+[outputtopology("triangle_cw")]
+[outputcontrolpoints(3)]
+[patchconstantfunc("HSConst")]
+CtrlPoint HSMain(InputPatch<CtrlPoint, 3> p, uint id : SV_OutputControlPointID) { return p[id]; }
+
+[domain("tri")]
+VSOut DSMain(PatchConst pc, float3 bary : SV_DomainLocation, const OutputPatch<CtrlPoint, 3> p)
+{
+    VSOut o;
+    float3 camRel = bary.x * p[0].camRel + bary.y * p[1].camRel + bary.z * p[2].camRel;
+    float3 nrm    = normalize(bary.x * p[0].nrm + bary.y * p[1].nrm + bary.z * p[2].nrm);
+    const float3 world = bary.x * p[0].world + bary.y * p[1].world + bary.z * p[2].world;
+    o.albedo = bary.x * p[0].albedo + bary.y * p[1].albedo + bary.z * p[2].albedo;
+    o.ao     = bary.x * p[0].ao + bary.y * p[1].ao + bary.z * p[2].ao;
+
+    const float fade = dispFadeAt(length(camRel));
+    if (fade > 0.001)
+    {
+        const float amp = gDispAmp * fade;
+        const float h0 = microRelief(world, nrm);
+        // Two tangent taps give the relief's own slope, which is what the
+        // shading needs: displacing without re-normalling just makes smooth
+        // bumps that catch the light as if they were flat.
+        const float3 t1 = normalize(abs(nrm.y) < 0.9 ? cross(nrm, float3(0, 1, 0)) : cross(nrm, float3(1, 0, 0)));
+        const float3 t2 = cross(nrm, t1);
+        const float e = 0.4;
+        const float h1 = microRelief(world + t1 * e, nrm);
+        const float h2 = microRelief(world + t2 * e, nrm);
+        camRel += nrm * (h0 * amp);
+        nrm = normalize(nrm - (t1 * (h1 - h0) + t2 * (h2 - h0)) * (amp / e));
+    }
+    o.camRel = camRel;
+    o.nrm    = nrm;
+    o.clip   = mul(float4(camRel, 1.0), gViewProj);
+    return o;
 }
 
 // -----------------------------------------------------------------------------
@@ -878,13 +1004,20 @@ struct FrameCB {
     float camUp[3];      float pad1;
     float camFwd[3];     float pad2;
     float material[8][4];
+    float tessTargetPx;  float pixPerRadian;
+    float dispFar;       float dispFade;
+    float dispAmp;       float tessMax;
+    float pad3;          float pad4;
 };
 static_assert(sizeof(FrameCB) % 16 == 0);
 
 struct ChunkCB {
     float offset[3];
     float lod;
+    float world[3];
+    float pad;
 };
+static_assert(sizeof(ChunkCB) % 16 == 0);
 
 struct FarCB {
     float camWorld[3];  float chunkSizeM;
@@ -1096,6 +1229,9 @@ int main(int argc, char** argv) {
     bool pipeStats = false;         // count pixel shader invocations: overdraw
     bool stripes = false;           // gradient-aligned stripe erosion on the heights
     float stripeAmp = 5.f, stripeWidth = 60.f;
+    bool tess = false;              // hardware tessellation + micro-relief up close
+    float dispAmp = 0.45f;          // metres; kept under step height, see below
+    float dispFar = 90.f, tessTargetPx = 14.f, tessMax = 7.f;
     int traceLod = 3;               // first LOD handed over as density instead of geometry
     bool fixedCam = false;
     double camArgs[5] = {};         // x y z yaw pitch (degrees)
@@ -1118,6 +1254,10 @@ int main(int argc, char** argv) {
         else if (a == "--far-trace") farTrace = true;
         else if (a == "--no-sort") sortChunks = false;
         else if (a == "--stripes") stripes = true;
+        else if (a == "--tess") tess = true;
+        else if (a == "--disp-amp") dispAmp = float(next(dispAmp));
+        else if (a == "--disp-far") dispFar = float(next(dispFar));
+        else if (a == "--tess-px") tessTargetPx = float(next(tessTargetPx));
         else if (a == "--stripe-amp") stripeAmp = float(next(stripeAmp));
         else if (a == "--stripe-width") stripeWidth = float(next(stripeWidth));
         else if (a == "--stats") pipeStats = true;
@@ -1259,6 +1399,19 @@ int main(int argc, char** argv) {
         !compile("VSSky", "vs_5_0", skyVsBlob) || !compile("PSSky", "ps_5_0", skyPsBlob))
         return 1;
     if (farTrace && !compile("PSFar", "ps_5_0", farPsBlob)) return 1;
+
+    Com<ID3DBlob> tessVsBlob, hsBlob, dsBlob;
+    Com<ID3D11VertexShader> tessVs;
+    Com<ID3D11HullShader> hs;
+    Com<ID3D11DomainShader> ds;
+    if (tess) {
+        if (!compile("VSTess", "vs_5_0", tessVsBlob) || !compile("HSMain", "hs_5_0", hsBlob) ||
+            !compile("DSMain", "ds_5_0", dsBlob))
+            return 1;
+        device->CreateVertexShader(tessVsBlob->GetBufferPointer(), tessVsBlob->GetBufferSize(), nullptr, tessVs.put());
+        device->CreateHullShader(hsBlob->GetBufferPointer(), hsBlob->GetBufferSize(), nullptr, hs.put());
+        device->CreateDomainShader(dsBlob->GetBufferPointer(), dsBlob->GetBufferSize(), nullptr, ds.put());
+    }
 
     Com<ID3D11VertexShader> vs, skyVs;
     Com<ID3D11PixelShader> ps, skyPs, farPs;
@@ -1453,6 +1606,7 @@ int main(int argc, char** argv) {
     bool wireframe = startWireframe;
     bool lodTint = startLodTint;
     bool cullBackfaces = true;
+    bool tessOn = tess;            // T toggles it, when --tess built the shaders
     double flyDistance = 0.0;
     double flySpeed = 55.0;        // metres/second along the loop
     float freeSpeed = 40.f;        // metres/second
@@ -1527,6 +1681,10 @@ int main(int argc, char** argv) {
         if (g_input.takePress('G')) wireframe = !wireframe;
         if (g_input.takePress('L')) lodTint = !lodTint;
         if (g_input.takePress('C')) cullBackfaces = !cullBackfaces;
+        if (g_input.takePress('T') && tess) {
+            tessOn = !tessOn;
+            std::printf("tessellation: %s\n", tessOn ? "on" : "off");
+        }
         if (g_input.takePress('R')) {
             camera.position = {spawn.x, spawn.y + 120.0, spawn.z};
             camera.lookAt({spawn.x + 200.0, spawn.y, spawn.z + 200.0});
@@ -1641,6 +1799,14 @@ int main(int argc, char** argv) {
                 fcb.material[i][3] = has ? table[i].roughness : 0.9f;
             }
         }
+        // Pixels per radian: how long a given edge comes out on screen, which is
+        // the only sane basis for a tessellation factor.
+        fcb.pixPerRadian = float(g_input.height) * 0.5f / fcb.tanHalfFovY;
+        fcb.tessTargetPx = tessTargetPx;
+        fcb.tessMax = tessMax;
+        fcb.dispFar = dispFar;
+        fcb.dispFade = dispFar * 0.45f;
+        fcb.dispAmp = tessOn ? dispAmp : 0.f;
         {
             D3D11_MAPPED_SUBRESOURCE map{};
             ctx->Map(frameCB.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
@@ -1667,12 +1833,22 @@ int main(int argc, char** argv) {
         ctx->PSSetShader(skyPs.get(), nullptr, 0);
         ctx->Draw(3, 0);
 
-        // Terrain.
+        // Terrain. With tessellation the same index buffer is reinterpreted as
+        // 3-control-point patches; nothing about the mesh data changes.
         ctx->IASetInputLayout(inputLayout.get());
+        ctx->IASetPrimitiveTopology(tessOn ? D3D11_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST
+                                           : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->OMSetDepthStencilState(dssTerrain.get(), 0);
         ctx->RSSetState(wireframe ? rsWire.get() : (cullBackfaces ? rsSolid.get() : rsNoCull.get()));
-        ctx->VSSetShader(vs.get(), nullptr, 0);
+        ctx->VSSetShader(tessOn ? tessVs.get() : vs.get(), nullptr, 0);
+        ctx->HSSetShader(tessOn ? hs.get() : nullptr, nullptr, 0);
+        ctx->DSSetShader(tessOn ? ds.get() : nullptr, nullptr, 0);
         ctx->PSSetShader(ps.get(), nullptr, 0);
+        if (tessOn) {
+            ID3D11Buffer* tcbs[] = {frameCB.get(), chunkCB.get()};
+            ctx->HSSetConstantBuffers(0, 2, tcbs);
+            ctx->DSSetConstantBuffers(0, 2, tcbs);
+        }
 
         uint32_t drawn = 0, culled = 0;
         uint64_t trianglesDrawn = 0;
@@ -1700,7 +1876,10 @@ int main(int argc, char** argv) {
             const ChunkGpuRegistry::Entry& e = *vc.e;
             const Vec3f rel = vc.rel;
 
-            ChunkCB ccb{{rel.x, rel.y, rel.z}, float(e.lod)};
+            ChunkCB ccb{{rel.x, rel.y, rel.z},
+                        float(e.lod),
+                        {float(e.origin.x), float(e.origin.y), float(e.origin.z)},
+                        0.f};
             D3D11_MAPPED_SUBRESOURCE map{};
             ctx->Map(chunkCB.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
             std::memcpy(map.pData, &ccb, sizeof(ccb));
@@ -1728,6 +1907,10 @@ int main(int argc, char** argv) {
         // meshed shell left as sky, so the ray is never marched behind
         // geometry that already won the depth test.
         if (farTrace && farPs.get()) {
+            // The fullscreen pass is triangles, not patches.
+            ctx->HSSetShader(nullptr, nullptr, 0);
+            ctx->DSSetShader(nullptr, nullptr, 0);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             const Vec3i dim = farBricks.indexDim();
             const Vec3d org = farBricks.indexOriginWorld();
             const float chunkM = float(farBricks.chunkSizeVoxels()) * world::kVoxelSize;

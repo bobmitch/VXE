@@ -1507,7 +1507,7 @@ int main(int argc, char** argv) {
     bool stripes = false;           // gradient-aligned stripe erosion on the heights
     float stripeAmp = 5.f, stripeWidth = 60.f;
     float worldScale = TerrainParams{}.worldScale;
-    bool shadows = true, shadowView = false;
+    bool shadows = true, shadowView = false, forceVsync = false;
     float digRadiusStart = 5.f;     // metres; - / = adjust it at runtime
     bool walk = false;              // first-person: eye height above the ground, no flying
     float eyeHeight = 2.f, walkSpeed = 4.5f;
@@ -1532,6 +1532,7 @@ int main(int argc, char** argv) {
         else if (a == "--width") width = UINT(next(width));
         else if (a == "--height") height = UINT(next(height));
         else if (a == "--novsync") vsync = false;
+        else if (a == "--vsync") forceVsync = true;
         else if (a == "--screenshot") shotPath = i + 1 < argc ? argv[++i] : "";
         else if (a == "--screenshot-at") shotAt = next(shotAt);
         else if (a == "--exit-after") exitAfter = next(exitAfter);
@@ -1574,7 +1575,12 @@ int main(int argc, char** argv) {
         }
     }
     const bool automated = !shotPath.empty() || exitAfter > 0.0;
-    if (automated) vsync = false;
+    // Automated runs drop vsync so a timed run is not just counting refreshes.
+    // --vsync puts it back, which is the only way to measure what an
+    // interactive session actually costs: paced to 60 Hz the GPU clocks down
+    // and the frame stretches to fill the interval, so a vsync-on GPU figure
+    // and a vsync-off one are not the same measurement at all.
+    if (automated && !forceVsync) vsync = false;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     maxLod = std::clamp(maxLod, 2, int(world::kMaxLod));
     g_input.width = width;
@@ -2789,7 +2795,16 @@ int main(int argc, char** argv) {
                     (unsigned long long)frameIndex, farBricks.overflowed() ? "  [ATLAS OVERFLOWED]" : "");
     std::printf("frame time  : %.3f ms mean over %llu frames (%.1f fps)%s\n", runTime * 1000.0 / double(frameIndex),
                 (unsigned long long)frameIndex, double(frameIndex) / runTime, vsync ? " [vsync on]" : "");
-    if (gpuSamples)
+    // With vsync on this total is the refresh interval, not the work: the
+    // frame's span swallows the wait for a free backbuffer, and a GPU paced to
+    // 60 Hz drops its clocks so everything inside it stretches too. Same scene,
+    // same 656 draws: 16.455 ms vsync on against 0.440 ms vsync off. Measure
+    // with vsync off, and read the sub-spans below as relative, not absolute --
+    // GPU work overlaps, so they do not sum to the total.
+    if (gpuSamples && vsync)
+        std::printf("gpu         : %.3f ms per frame -- VSYNC ON, so this is the refresh interval and not a"
+                    " measurement. Re-run with --novsync.\n", gpuTotalMs / double(gpuSamples));
+    else if (gpuSamples)
         std::printf("gpu         : %.3f ms per frame, of which %.3f ms shadow cascades (%.0f%%), %.0f draws/frame\n",
                     gpuTotalMs / double(gpuSamples), gpuShadowMs / double(gpuSamples),
                     100.0 * gpuShadowMs / std::max(gpuTotalMs, 1e-9), double(shadowDraws) / double(std::max<uint64_t>(1, frameIndex)));

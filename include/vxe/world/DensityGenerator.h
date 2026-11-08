@@ -50,7 +50,38 @@ struct TerrainParams {
     float cheeseThreshold = 0.55f;
     float caveSurfaceShell = 10.f;     // metres of rock kept above caves outside entrances
     float bedrockY = -480.f;
-    int32_t maxCaveLod = 1;            // caves are not generated for coarser LODs
+
+    // Caves past this LOD are not generated at all. At 1 that was a cliff
+    // rather than a fade: every cave in a whole ring of chunks existed on one
+    // side of the LOD1/LOD2 boundary and not on the other, and the ring swept
+    // across the world as the camera moved.
+    //
+    // 3 rather than 4 is measured. Thresholded noise does not coarsen into
+    // fewer, larger voids -- it fragments into blobs -- so carrying it outward
+    // costs 4-6x the triangles of solid rock at every level, and at LOD4 it was
+    // 12x for caves that are sub-pixel at the 1 km such a chunk implies. LOD4
+    // stays solid; LOD2 and LOD3 carry the fade.
+    int32_t maxCaveLod = 3;
+
+    // A void of half-width r only survives sampling at s metres while r >~ s,
+    // so coarse levels lose thin caves whatever the operator. caveSdf is a
+    // distance in metres, so the cheap answer is to grow the void as the
+    // samples spread out: dilation = this * (stride - 2) metres. It is
+    // deliberately zero at LOD0 and LOD1, which keeps the near field and the
+    // measured LOD0|LOD1 seam exactly as they were.
+    //
+    // This is a trade, not a fix. Caves read too fat at distance and tighten as
+    // you approach, and because dilating an SDF grows every negative region,
+    // rock thinner than the dilation erodes and near-miss tunnels join up -- so
+    // topology at range is not the topology underfoot. Parametric voids are the
+    // real answer; this buys a gradual fade in the meantime.
+    float caveDilationPerCell = 0.5f;
+
+    // At LOD >= 2 only caves within this depth of the surface are evaluated.
+    // Deep caves cost three 3D noise fields over a 38^3 block to generate and
+    // cannot be seen from the >= 256 m such a chunk implies, because there is
+    // rock in the way.
+    float coarseCaveDepth = 160.f;
 };
 
 struct ChunkGenStats {

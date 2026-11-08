@@ -234,7 +234,7 @@ ColumnShape shapeColumn(const TerrainParams& p, float cont, float mmask, float r
 
 // Combine column shape + 3D terms into a clamped signed distance and material.
 inline void composeSample(const TerrainParams& p, const ColumnShape& col, float wy, float overhang, bool caves,
-                          float a, float b, float cheese, float& outDensity, MaterialId& outMat) {
+                          float a, float b, float cheese, float caveDilation, float& outDensity, MaterialId& outMat) {
     float d = wy - col.height;
     d -= overhang * lerp(p.overhangAmpPlains, p.overhangAmpMountains, col.mask);
 
@@ -246,7 +246,10 @@ inline void composeSample(const TerrainParams& p, const ColumnShape& col, float 
     if (caves && wy < col.height) {
         const float spaghetti = (std::sqrt(a * a + b * b) - p.spaghettiRadius) * p.spaghettiScale * 0.5f;
         const float cavern    = (p.cheeseThreshold - cheese) * p.cheeseScale * 0.25f;
-        float caveSdf = std::min(spaghetti, cavern);           // < 0 inside a cave
+        // Dilate before the shell and bedrock guards below, so growing the void
+        // can never punch it through the surface or the floor: those two terms
+        // still push back at full strength.
+        float caveSdf = std::min(spaghetti, cavern) - caveDilation;   // < 0 inside a cave
         const float depth = col.height - wy;
         caveSdf += std::max(0.f, p.caveSurfaceShell - depth) * (1.f - col.entrance);
         caveSdf += std::max(0.f, (p.bedrockY + 24.f) - wy) * 2.f; // solid bedrock floor
@@ -313,7 +316,14 @@ ChunkGenStats DensityGenerator::generate(const ChunkKey& key, DensityField& out)
         stats.uniform = true;
         return stats;
     }
-    const bool caves = key.lod <= p.maxCaveLod && yMin < maxH && yMax > p.bedrockY;
+    // At LOD >= 2 the chunk is at least a couple of hundred metres away, so only
+    // caves near enough to the surface to break through it can be seen; deep
+    // ones cost three 3D fields to generate and are behind rock.
+    const bool nearSurface = key.lod < 2 || yMax > minH - p.coarseCaveDepth;
+    const bool caves = key.lod <= p.maxCaveLod && yMin < maxH && yMax > p.bedrockY && nearSurface;
+    // Zero at LOD0 and LOD1, so the near field and the measured LOD0|LOD1 seam
+    // are untouched; grows with the sample spacing above that.
+    const float caveDilation = p.caveDilationPerCell * float(std::max(0, stride - 2));
     const bool overhangBand = yMax > minH - slack && yMin < maxH + slack;
 
     // ---- 3D pass (only the fields we need) --------------------------------
@@ -335,7 +345,8 @@ ChunkGenStats DensityGenerator::generate(const ChunkKey& key, DensityField& out)
                 const ColumnShape cs{sc.height[size_t(col)], sc.mask01[size_t(col)], sc.entrance01[size_t(col)]};
                 composeSample(p, cs, wy, overhangBand ? sc.overhang[size_t(idx)] : 0.f, caves,
                               caves ? sc.caveA[size_t(idx)] : 0.f, caves ? sc.caveB[size_t(idx)] : 0.f,
-                              caves ? sc.cheese[size_t(idx)] : 0.f, out.density[size_t(idx)], out.material[size_t(idx)]);
+                              caves ? sc.cheese[size_t(idx)] : 0.f, caveDilation, out.density[size_t(idx)],
+                              out.material[size_t(idx)]);
             }
         }
     }
@@ -363,8 +374,10 @@ float DensityGenerator::sampleDensity(const Vec3i& v) const {
     const float oh = std::abs(y - c.height) < slack ? m_impl->overhang.single3D(x, y, z, seed) : 0.f;
     const bool caves = y < c.height && y > p.bedrockY;
     float d; MaterialId m;
+    // LOD0 semantics: no dilation, so edits and queries see the true cave.
     composeSample(p, c, y, oh, caves, caves ? m_impl->caveA.single3D(x, y, z, seed) : 0.f,
-                  caves ? m_impl->caveB.single3D(x, y, z, seed) : 0.f, caves ? m_impl->cheese.single3D(x, y, z, seed) : 0.f, d, m);
+                  caves ? m_impl->caveB.single3D(x, y, z, seed) : 0.f,
+                  caves ? m_impl->cheese.single3D(x, y, z, seed) : 0.f, 0.f, d, m);
     return d;
 }
 

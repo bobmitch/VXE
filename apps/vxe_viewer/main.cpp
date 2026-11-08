@@ -372,7 +372,11 @@ float microRelief(float3 wp, float3 n)
     const float d = (valueNoise(wp * 3.1) - 0.5) * 0.35;
     const float relief = h + r * 0.55 + d;
     const float steep = 1.0 - saturate(n.y);
-    return relief * (0.55 + 1.5 * steep * steep);
+    // Gentle ground gets half what it did: at eye level you are mostly looking
+    // at it, and that much relief read as noise rather than as ground. Steep
+    // faces keep theirs, since that is the half doing the useful work -- they
+    // are the silhouette, and they are not what you are standing on.
+    return relief * (0.28 + 1.77 * steep * steep);
 }
 
 struct PatchConst { float edges[3] : SV_TessFactor; float inside : SV_InsideTessFactor; };
@@ -1817,6 +1821,12 @@ int main(int argc, char** argv) {
                 std::printf("%s at (%.0f, %.0f, %.0f): %u voxels, %u resident samples patched\n",
                             dig ? "dug" : "filled", op.center.x, op.center.y, op.center.z, res.voxelsWritten,
                             res.residentSamplesPatched);
+            } else {
+                // A miss used to be silent, which is indistinguishable from not
+                // having clicked. At eye level you tend to look level or a
+                // little up, and the ray then sails over the ground entirely.
+                std::printf("%s missed: no terrain within 250 m of the crosshair (aim down at the ground)\n",
+                            dig ? "dig" : "fill");
             }
         }
 

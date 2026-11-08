@@ -63,19 +63,30 @@ struct TerrainParams {
     // stays solid; LOD2 and LOD3 carry the fade.
     int32_t maxCaveLod = 3;
 
-    // A void of half-width r only survives sampling at s metres while r >~ s,
-    // so coarse levels lose thin caves whatever the operator. caveSdf is a
-    // distance in metres, so the cheap answer is to grow the void as the
-    // samples spread out: dilation = this * (stride - 2) metres. It is
-    // deliberately zero at LOD0 and LOD1, which keeps the near field and the
-    // measured LOD0|LOD1 seam exactly as they were.
+    // A void only survives sampling at s metres while it is wide enough for a
+    // sample to land inside it, so coarse levels drop thin caves whatever the
+    // operator. caveSdf is a distance in metres, so they can be widened to suit
+    // -- but only as far as they fall short, and only the term that is actually
+    // thin.
     //
-    // This is a trade, not a fix. Caves read too fat at distance and tighten as
-    // you approach, and because dilating an SDF grows every negative region,
-    // rock thinner than the dilation erodes and near-miss tunnels join up -- so
-    // topology at range is not the topology underfoot. Parametric voids are the
-    // real answer; this buys a gradual fade in the meantime.
-    float caveDilationPerCell = 0.5f;
+    // Keep a tunnel at least this many half-sample-spacings wide:
+    //
+    //   dilation = max(0, stride/2 * margin - tunnelRadius)
+    //
+    // The subtraction is what makes it adaptive. A first attempt widened every
+    // void by a flat amount per level, which put the same metres on a 4 m
+    // tunnel as on a 40 m cavern -- +75% against +7% -- so the size *ordering*
+    // of what you saw at range stopped matching what you found up close. Here a
+    // feature already wider than the sampling gets nothing, which zeroes this
+    // at LOD0 through LOD2 and leaves only LOD3 widened, and the cheese term is
+    // never touched at all: its features run to tens of metres and were never
+    // the ones falling through.
+    //
+    // Still a trade. Tunnels at LOD3 read wider than they are and tighten as
+    // you approach, and since dilating an SDF grows every negative region, rock
+    // thinner than the dilation erodes there. Parametric voids are the real
+    // answer -- a capsule that knows its own radius needs none of this.
+    float caveDilationMargin = 1.5f;
 
     // At LOD >= 2 only caves within this depth of the surface are evaluated.
     // Deep caves cost three 3D noise fields over a 38^3 block to generate and

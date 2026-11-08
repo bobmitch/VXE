@@ -244,12 +244,15 @@ inline void composeSample(const TerrainParams& p, const ColumnShape& col, float 
     // entirely above its column heights yields identical samples either way,
     // so shared seam samples always agree with the neighbour.
     if (caves && wy < col.height) {
-        const float spaghetti = (std::sqrt(a * a + b * b) - p.spaghettiRadius) * p.spaghettiScale * 0.5f;
+        // Only the tunnels are widened. Cavern features run to tens of metres,
+        // so they survive coarse sampling unaided and widening them would only
+        // break the size ordering between the two.
+        const float spaghetti = (std::sqrt(a * a + b * b) - p.spaghettiRadius) * p.spaghettiScale * 0.5f - caveDilation;
         const float cavern    = (p.cheeseThreshold - cheese) * p.cheeseScale * 0.25f;
-        // Dilate before the shell and bedrock guards below, so growing the void
-        // can never punch it through the surface or the floor: those two terms
-        // still push back at full strength.
-        float caveSdf = std::min(spaghetti, cavern) - caveDilation;   // < 0 inside a cave
+        // Widen before the shell and bedrock guards below, so growing a void can
+        // never punch it through the surface or the floor: those two terms still
+        // push back at full strength.
+        float caveSdf = std::min(spaghetti, cavern);                  // < 0 inside a cave
         const float depth = col.height - wy;
         caveSdf += std::max(0.f, p.caveSurfaceShell - depth) * (1.f - col.entrance);
         caveSdf += std::max(0.f, (p.bedrockY + 24.f) - wy) * 2.f; // solid bedrock floor
@@ -321,9 +324,12 @@ ChunkGenStats DensityGenerator::generate(const ChunkKey& key, DensityField& out)
     // ones cost three 3D fields to generate and are behind rock.
     const bool nearSurface = key.lod < 2 || yMax > minH - p.coarseCaveDepth;
     const bool caves = key.lod <= p.maxCaveLod && yMin < maxH && yMax > p.bedrockY && nearSurface;
-    // Zero at LOD0 and LOD1, so the near field and the measured LOD0|LOD1 seam
-    // are untouched; grows with the sample spacing above that.
-    const float caveDilation = p.caveDilationPerCell * float(std::max(0, stride - 2));
+    // How far a tunnel falls short of being sampleable at this stride, and so
+    // how much to widen it by. Zero wherever the tunnels are already wide
+    // enough, which includes the whole near field.
+    const float tunnelRadius = p.spaghettiRadius * p.spaghettiScale * 0.5f;
+    const float wantedRadius = float(stride) * world::kVoxelSize * 0.5f * p.caveDilationMargin;
+    const float caveDilation = std::max(0.f, wantedRadius - tunnelRadius);
     const bool overhangBand = yMax > minH - slack && yMin < maxH + slack;
 
     // ---- 3D pass (only the fields we need) --------------------------------

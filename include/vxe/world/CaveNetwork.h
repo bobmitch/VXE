@@ -72,6 +72,24 @@ struct CaveParams {
     float chamberChance = 0.3f;      // per branch point
     float chamberRadius = 13.f;
     float chamberRadiusVar = 7.f;
+    // A chamber is a cluster of overlapping lobes rather than one ellipsoid.
+    // Unioned by min() they read as a room with alcoves instead of a bowl.
+    int32_t chamberLobes = 4;
+
+    // Systems come in sizes, drawn once per system and applied to length,
+    // passage width and mouth alike -- so a long system announces itself with a
+    // big opening and a short one can still be a surprise.
+    float sizeVariation = 0.55f;     // +/- this fraction around 1
+
+    // A mouth is wider than the passage behind it, and stays wide for a little
+    // way in. Without this an entrance is a 3 m hole in a hillside, which in
+    // practice could not be found even with a marker standing over it.
+    float entranceFlare = 3.4f;      // mouth radius as a multiple of the passage
+    float throatLength = 18.f;       // metres of flared opening before it narrows
+
+    // How much the passage radius breathes along its length. Constrictions and
+    // widenings, rather than a tube of constant bore.
+    float radiusWander = 0.6f;
 
     // Entrance search: candidates per cell, and how much lower than the cell's
     // mean a candidate has to sit before it counts as somewhere water collects.
@@ -79,6 +97,14 @@ struct CaveParams {
     int32_t entrancesPerSystem = 2;
     float bedrockY = -440.f;
 };
+
+// The widest anything in a system can be: a mouth, on the largest system size.
+// Chunk queries add it to their reach, because a cell is asked about by
+// distance to the cell, and a fat segment at the edge of its allowance reaches
+// further than the cell does.
+inline float maxCaveRadius(const CaveParams& p) {
+    return p.tunnelRadius * p.entranceFlare * (1.f + p.sizeVariation);
+}
 
 // One capsule of passage. Radii at each end let a passage taper and let a
 // chamber mouth open out of it.

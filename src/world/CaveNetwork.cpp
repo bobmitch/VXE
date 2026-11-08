@@ -28,6 +28,17 @@ float chamberDistance(const Vec3f& p, const CaveChamber& c) {
     return (k - 1.f) * minR;
 }
 
+// Value noise over the step index: correlated along the passage rather than
+// jittering per segment, so the bore widens and pinches in runs.
+float pathNoise(int32_t i, int32_t period, uint32_t salt) {
+    const int32_t k = i / period;
+    const float f = float(i - k * period) / float(period);
+    const float a = det::unit(det::hash(uint32_t(k) * 0x9E3779B9u ^ salt));
+    const float b = det::unit(det::hash(uint32_t(k + 1) * 0x9E3779B9u ^ salt));
+    const float t = f * f * (3.f - 2.f * f);
+    return a + (b - a) * t;
+}
+
 void growBounds(Aabbf& b, const Vec3f& c, float r) {
     b.min = vmin(b.min, c - Vec3f(r));
     b.max = vmax(b.max, c + Vec3f(r));
@@ -84,10 +95,22 @@ std::vector<Candidate> findBasins(const CaveParams& p, int32_t seed, float x0, f
 // recursion is bounded by depth rather than by segment count so a system cannot
 // run away.
 void walk(const CaveParams& p, det::Stream& rs, const Vec3f& from, float bearing, float descent, int32_t steps,
-          int32_t branchDepth, float entranceY, const Aabbf& allowed, CaveSystem& sys) {
+          int32_t branchDepth, float entranceY, float scale, const Aabbf& allowed, CaveSystem& sys) {
     Vec3f cur = from;
     float yaw = bearing;
-    float radius = p.tunnelRadius + rs.range(-p.tunnelRadiusVar, p.tunnelRadiusVar);
+    const uint32_t salt = rs.next();
+    const float base = (p.tunnelRadius + rs.range(-p.tunnelRadiusVar, p.tunnelRadiusVar)) * scale;
+    // Two periods of wander give runs of wide passage with pinches between,
+    // which is most of the difference between a cave and a pipe.
+    const auto radiusAt = [&](int32_t i) {
+        const float w = pathNoise(i, 6, salt) * 0.62f + pathNoise(i, 2, salt ^ 0x5BD1u) * 0.38f;
+        const float breathe = 1.f + p.radiusWander * (w * 2.f - 1.f);
+        // Taper away over the last third, so a passage ends rather than stops.
+        const float t = float(i) / float(std::max(1, steps));
+        const float taper = t < 0.66f ? 1.f : 1.f - 0.72f * ((t - 0.66f) / 0.34f);
+        return std::max(1.1f, base * breathe * taper);
+    };
+    float radius = radiusAt(0);
 
     for (int32_t i = 0; i < steps; ++i) {
         // Wander. Scaled by depth so the first few steps stay near the bearing
@@ -112,7 +135,7 @@ void walk(const CaveParams& p, det::Stream& rs, const Vec3f& from, float bearing
         if (next.x < allowed.min.x || next.x > allowed.max.x || next.z < allowed.min.z || next.z > allowed.max.z)
             return;
 
-        const float nextRadius = std::max(1.4f, radius + rs.range(-0.5f, 0.5f));
+        const float nextRadius = radiusAt(i + 1);
         CaveSegment seg{cur, next, radius, nextRadius};
         sys.segments.push_back(seg);
         growBounds(sys.bounds, cur, radius);
@@ -127,18 +150,25 @@ void walk(const CaveParams& p, det::Stream& rs, const Vec3f& from, float bearing
         if (branching || rs.chance(p.chamberChance * 0.25f)) {
             if (rs.chance(p.chamberChance)) {
                 CaveChamber ch;
-                const float r = p.chamberRadius + rs.range(-p.chamberRadiusVar, p.chamberRadiusVar);
-                ch.centre = cur;
-                // Wider than tall: a room, not a bubble.
-                ch.radii = {r * rs.range(0.9f, 1.5f), r * rs.range(0.45f, 0.8f), r * rs.range(0.9f, 1.5f)};
-                sys.chambers.push_back(ch);
-                growBounds(sys.bounds, ch.centre, std::max(ch.radii.x, std::max(ch.radii.y, ch.radii.z)));
+                const float r = (p.chamberRadius + rs.range(-p.chamberRadiusVar, p.chamberRadiusVar)) * scale;
+                // Several overlapping lobes around the passage, each offset and
+                // squashed differently. One ellipsoid reads as a bowl; a
+                // cluster reads as a room with alcoves and a broken roof.
+                for (int32_t l = 0; l < p.chamberLobes; ++l) {
+                    const float lr = r * (l == 0 ? 1.f : rs.range(0.45f, 0.85f));
+                    ch.centre = cur + Vec3f{rs.range(-r, r) * 0.7f, rs.range(-r, r) * 0.3f, rs.range(-r, r) * 0.7f} *
+                                          (l == 0 ? 0.f : 1.f);
+                    // Wider than tall: a room, not a bubble.
+                    ch.radii = {lr * rs.range(0.9f, 1.5f), lr * rs.range(0.45f, 0.8f), lr * rs.range(0.9f, 1.5f)};
+                    sys.chambers.push_back(ch);
+                    growBounds(sys.bounds, ch.centre, std::max(ch.radii.x, std::max(ch.radii.y, ch.radii.z)));
+                }
             }
         }
         if (branching) {
             const float turn = rs.range(0.6f, 1.5f) * (rs.chance(0.5f) ? 1.f : -1.f);
             walk(p, rs, cur, yaw + turn, descent * rs.range(0.5f, 1.2f), std::max(4, steps / 2), branchDepth + 1,
-                 entranceY, allowed, sys);
+                 entranceY, scale, allowed, sys);
         }
     }
 }
@@ -160,26 +190,39 @@ CaveSystem buildCaveSystem(const CaveParams& p, int32_t seed, int32_t cellX, int
     const Aabbf allowed{{x0 - slack, -1e30f, z0 - slack}, {x0 + p.regionSize + slack, 1e30f, z0 + p.regionSize + slack}};
 
     det::Stream rs(det::hash2(cellX, cellZ, seed ^ 0x7F4A7C15));
+    // One size for the whole system, so length and bore and mouth agree: a long
+    // system advertises itself, a short one can still be a surprise.
+    const float scale = 1.f + rs.range(-p.sizeVariation, p.sizeVariation);
+    const int32_t steps = std::max(6, int32_t(float(p.trunkSteps) * scale));
     const int32_t wanted = std::min(p.entrancesPerSystem, int32_t(basins.size()));
     for (int32_t e = 0; e < wanted; ++e) {
         const Candidate& c = basins[size_t(e)];
         // Sea floor and below is not where a walk-in entrance belongs.
         if (c.pos.y < 3.f) continue;
 
-        // Start just under the surface and head in along the way the ground
-        // drains. The first segment rises to meet the surface so the mouth is
-        // open rather than sealed under a metre of rock.
-        const Vec3f mouth{c.pos.x, c.pos.y + 1.5f, c.pos.z};
+        // The mouth. Wider than the passage behind it and wide for a way in,
+        // because a 3 m hole in a hillside could not be found even with a
+        // marker standing over it. It starts above the surface so the opening
+        // is cut rather than sealed under a last metre of rock.
+        const float bore = p.tunnelRadius * scale;
+        const float flare = bore * p.entranceFlare;
         const float bearing = std::atan2(c.downhill.z, c.downhill.x);
-        const Vec3f inside{c.pos.x + c.downhill.x * 8.f, c.pos.y - 6.f, c.pos.z + c.downhill.z * 8.f};
+        const Vec3f mouth{c.pos.x, c.pos.y + flare * 0.55f, c.pos.z};
+        const float run = p.throatLength * scale;
+        const Vec3f waist{c.pos.x + c.downhill.x * run, c.pos.y - run * 0.35f, c.pos.z + c.downhill.z * run};
+        const Vec3f inside{c.pos.x + c.downhill.x * run * 1.9f, c.pos.y - run * 0.95f,
+                           c.pos.z + c.downhill.z * run * 1.9f};
 
-        CaveSegment throat{mouth, inside, p.tunnelRadius * 0.85f, p.tunnelRadius};
-        sys.segments.push_back(throat);
+        // Two segments: a flared opening that holds its width, then the
+        // narrowing into the passage proper.
+        sys.segments.push_back({mouth, waist, flare, flare * 0.8f});
+        sys.segments.push_back({waist, inside, flare * 0.8f, bore});
         sys.entrances.push_back(mouth);
-        growBounds(sys.bounds, mouth, p.tunnelRadius);
-        growBounds(sys.bounds, inside, p.tunnelRadius);
+        growBounds(sys.bounds, mouth, flare);
+        growBounds(sys.bounds, waist, flare);
+        growBounds(sys.bounds, inside, bore);
 
-        walk(p, rs, inside, bearing, p.descentRate, p.trunkSteps, 0, c.pos.y, allowed, sys);
+        walk(p, rs, inside, bearing, p.descentRate, steps, 0, c.pos.y, scale, allowed, sys);
     }
     return sys;
 }

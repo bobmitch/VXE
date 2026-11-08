@@ -432,7 +432,11 @@ float microRelief(float3 wp, float3 n)
     const float r = 0.5 - abs(valueNoise(wp * 1.3) - 0.5) * 2.0;    // ridged: creases, not bumps
     const float d = (valueNoise(wp * 3.1) - 0.5) * 0.35;
     const float relief = h + r * 0.55 + d;
-    const float steep = 1.0 - saturate(n.y);
+    // Steepness is how far the surface is from horizontal, which is abs(n.y) --
+    // not 1 - n.y. With the latter a cave roof, whose normal points straight
+    // down, scored as maximally steep and took seven times the relief of the
+    // floor under it, which is exactly how it looked.
+    const float steep = 1.0 - abs(n.y);
     // Gentle ground gets half what it did: at eye level you are mostly looking
     // at it, and that much relief read as noise rather than as ground. Steep
     // faces keep theirs, since that is the half doing the useful work -- they
@@ -1412,7 +1416,7 @@ int main(int argc, char** argv) {
     // 0.8 m peak, but the steep weighting means walkable ground sees about a
     // quarter of that and near-vertical rock the rest -- so the figure that has
     // to stay under step height is the flat-ground one, not this.
-    float dispAmp = 0.8f;
+    float dispAmp = 0.62f;
     // Reach matters as much as amplitude for silhouettes: a ridge is usually
     // further off than the ground you are standing on, and gets no detail at
     // all once the tessellation factor falls back to 1.

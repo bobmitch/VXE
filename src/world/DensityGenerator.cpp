@@ -363,7 +363,7 @@ ChunkGenStats DensityGenerator::generate(const ChunkKey& key, DensityField& out)
         const Aabbf chunkBounds{origin, origin + Vec3f(span)};
         // Widened by the same slack a system is allowed to stray outside its
         // own cell, so a passage reaching in from next door is still asked for.
-        const float reach = kDensityClamp + caveGrow + p.cave.regionSize * kCellSlack;
+        const float reach = kDensityClamp + caveGrow + p.cave.regionSize * kCellSlack + maxCaveRadius(p.cave);
         const int32_t c0x = int32_t(std::floor((x0 - reach) / p.cave.regionSize));
         const int32_t c1x = int32_t(std::floor((x0 + span + reach) / p.cave.regionSize));
         const int32_t c0z = int32_t(std::floor((z0 - reach) / p.cave.regionSize));
@@ -436,7 +436,7 @@ void DensityGenerator::caveEntrancesNear(const Vec3d& centre, float radius, std:
     out.clear();
     if (!m_params.caves) return;
     const float cell = m_params.cave.regionSize;
-    const float reach = radius + cell * kCellSlack;
+    const float reach = radius + cell * kCellSlack + maxCaveRadius(m_params.cave);
     const int32_t c0x = int32_t(std::floor((centre.x - reach) / double(cell)));
     const int32_t c1x = int32_t(std::floor((centre.x + reach) / double(cell)));
     const int32_t c0z = int32_t(std::floor((centre.z - reach) / double(cell)));
@@ -478,7 +478,7 @@ float DensityGenerator::sampleDensity(const Vec3i& v) const {
     if (p.caves && y > p.bedrockY) {
         const int32_t cx = int32_t(std::floor(x / p.cave.regionSize));
         const int32_t cz = int32_t(std::floor(z / p.cave.regionSize));
-        const int32_t r = 1 + int32_t(kCellSlack);     // matches the chunk path's widening
+        const int32_t r = 1 + int32_t(kCellSlack + maxCaveRadius(p.cave) / p.cave.regionSize);
         for (int32_t dz = -r; dz <= r; ++dz)
             for (int32_t dx = -r; dx <= r; ++dx) {
                 const CaveSystem& sysRef = cachedSystem(cx + dx, cz + dz);

@@ -150,7 +150,7 @@ around, and it has to be able to find you.
 
 This knowingly picks the expensive option. Navigation over destructible voxel terrain is unstarted,
 and `DeltaStore` makes every edit permanent, so static navmesh baking is off the table. Nothing else
-in this document is blocked on a problem that size, and it moves to the top of §9.
+in this document is blocked on a problem that size, and it moves to the top of §10.
 
 ### Candidates
 
@@ -829,7 +829,209 @@ authoritative state rather than a local log.
 
 ---
 
-## 9. Open questions, ranked
+## 9. The underground
+
+**[proposed]**
+
+Every section above this one is about the surface. Biomes are chosen by climate and elevation (§4),
+the guarantees are about buildable ground and land connectivity (§7), legibility is a view from a
+ridgeline (§7). The generator is built the same way and is honest about it: the expensive
+multi-octave shaping runs on 38 × 38 columns per chunk, and the underground is three noise fields
+subtracted from the result afterwards.
+
+That is backwards for the loop this document settled on. §2 chose frontier settlement **with the
+underground as the reason a holding is sited where it is** — and then left the underground as the one
+part of the world generated without intent.
+
+### What is actually there today
+
+`DensityGenerator` carves caves with Minecraft 1.18's recipe, down to the vocabulary:
+
+| Term | What it is | Parameter |
+|---|---|---|
+| **Spaghetti** | Two ridged FBm fields intersected near their zero sets → winding tubes | `spaghettiScale` 110 m, `spaghettiRadius` ≈ 4 m |
+| **Cheese** | One thresholded FBm → blobby chambers | `cheeseScale` 220 m, `cheeseThreshold` 0.55 |
+| **Surface shell** | Keeps 10 m of rock above caves except where an entrance field says otherwise | `caveSurfaceShell` |
+| **LOD cutoff** | Caves are generated for LOD ≤ 1 and do not exist past it | `maxCaveLod` 1 |
+
+It is fast, and it is bit-deterministic across SIMD levels, which matters more than it sounds (§8).
+It is also the thing to replace, and it is worth being precise about why rather than asserting that
+noise is bad.
+
+### §1 is a surface rule, and always was
+
+§1 places biomes and fixes what the world looks like from outside — continuous land and water, a
+biome as a region of it, "grounded, believable landscape, not floating fantasy geometry". Every
+clause of it concerns something seen from somewhere else, which is why it is **[decided]** and why
+nothing here moves it. It is what makes a ridgeline readable, what makes §7's reconnaissance work at
+all, and what stops the world looking like a toy at 2 km.
+
+**The underground was never inside its scope.** Nothing down there is placed on the biome map,
+nothing is read at distance, nothing is visible from outside at all. So this section neither narrows
+§1 nor needs it relaxed — it answers a question §1 never asked: what does the underground owe
+instead?
+
+**Not believability.** There is no horizon, no skyline, no silhouette, no climate to infer. The
+player's whole experience is local, enclosed, and lit by whatever they brought, which makes
+geological faithfulness unobservable in principle — and expensive in practice, because a faithful
+cave system is mostly narrow, mostly dead-ending, mostly uniform and mostly dark. Real caving is a
+sport about discomfort. It is not the thing to simulate.
+
+What it owes instead is the opposite of a silhouette: **places worth reaching, remembering and
+describing to somebody else.** That is what licenses, deliberately:
+
+* **Chambers far larger than rock mechanics permit.** A 150 m void with a floor worth fighting on is
+  the most valuable single thing the underground can contain, and it is structurally absurd. Build
+  it.
+* **Light with no business existing.** Bioluminescence, lava glow, mineral fluorescence, daylight
+  from impossible angles. Darkness is the Hollows' hazard (§5); unlit kilometres are not a hazard,
+  they are an absence.
+* **Verticality and floors that cooperate.** Navigable routes, standable ground, shafts that read as
+  shafts. Creatures have to path through this (§6) and the player has to fight in it.
+* **Underground character that does not follow from the rock above it.** The surface biome picks the
+  cave character because that is the legible rule, not because the geology implies it.
+
+What stays constrained is the *substrate*, not the shape — and that is this section's load-bearing
+rule:
+
+> **The underground is terrain, not level geometry.** Whatever places it emits density into the same
+> field the surface uses, so it meshes, collides, LODs and — above all — **digs** like everything
+> else.
+
+§2's test is the reason. If a player cannot cut into the wall of a chamber and keep going, the
+underground is a set of rooms, and a set of rooms could have been built in any engine. Valheim's
+dungeons and Minecraft's structures both sit on the wrong side of that line. We cannot.
+
+### What noise cannot do
+
+Four failures, in order of what they cost:
+
+1. **It cannot make biomes differ.** Noise is stationary — the same statistics everywhere, by
+   construction. §5 asks the Hollows for karst and the cinder flats for "long, smooth, rarely
+   branching" lava tubes, and no parameter change to a pair of FBm fields yields two topologies.
+   Retuning `spaghettiScale` per biome gives wider or narrower spaghetti, not a different kind of
+   cave.
+2. **It cannot answer a question about connectivity.** Does this tunnel lead anywhere? Is that
+   chamber reachable without digging? Is there a route from this entrance down to 400 m? Noise has no
+   answers because it has no representation — the cave exists only once the field has been evaluated
+   everywhere, which is precisely what §7's validation and §8's seed tooling cannot afford to do.
+3. **It has no destinations.** Exploration needs places worth reaching and worth remembering.
+   Thresholded noise produces texture, uniformly, forever: no "the big chamber", nothing to navigate
+   *toward*, and nothing to tell someone else to go and find.
+4. **It does not survive LOD.** `maxCaveLod = 1` is not a tuning choice, it is a consequence — a
+   field defined by thresholds has no coarse representation, so caves cease to exist past LOD1.
+   Entrances pop in, nothing underground is observable at range (§7), and the navigation graph (§6)
+   has nothing to work with beyond the live area.
+
+### What the reference games actually teach
+
+| Game | Its model | Take | Leave |
+|---|---|---|---|
+| **Minecraft** | Noise caves *and* carvers *and* placed structures, three layers composed; a seed culture that outlived its own versions | Composition — the caves we copied are only one of its three layers. And seeds as an artifact players trade | Its underground has few destinations of its own; the structures do that work |
+| **No Man's Sky** | Everything derived from a seed at planetary scale; caves as shelter and as biome flavour; unapologetically unreal light and colour | Seed-driven variety at scale, and the licence above — its caves never pretend to be geology | Procedural sameness: variety across planets, uniformity within one |
+| **Valheim** | Biome identity with gated materials; dungeons assembled from room prefabs, placed on the map and entered seamlessly | Already the roster's reference (§5). The **room-graph** is the important half — a dungeon is a graph of placed pieces, not a noise field | Dungeon interiors are separate geometry rather than terrain: the wrong side of the substrate rule |
+| **Enshrouded** | Voxel terrain at high fidelity, full terraforming, and a large genuinely diggable underground | The fidelity and flexibility target, and the proof that a voxel underground carries real content | One authored world. We need its qualities out of a seed, which is the harder problem |
+
+Side by side the synthesis is obvious: **Valheim's room graph, Enshrouded's substrate, Minecraft's
+and No Man's Sky's seeds.**
+
+### The model: place the network, let noise texture it
+
+Four layers, each a pass over the coarse tier (§8), each queryable before anything is meshed.
+
+1. **Region.** The tunnel pass §8 already names: per 64 m cell, does an underground exist here, at
+   what density, and in which **topology class**. Driven by biome, blended across borders like every
+   other biome-driven parameter (§4).
+2. **Network.** Within a region, a graph placed deterministically from the seed — nodes are chambers,
+   junctions, shafts and entrances; edges are tunnels. Connectivity becomes a property of the graph,
+   guaranteed by construction rather than hoped for, and *queryable without meshing*, which is what
+   §7's validation and §8's seed tooling have been asking for all along.
+3. **Geometry.** Edges swept as capsule chains, chambers as unions of ellipsoids, composed into the
+   density field with the smooth CSG the engine already performs. §8 proposed exactly this for set
+   pieces — "chambers as ellipsoid unions, tunnels as capsule chains" — and the reason it gave there
+   is what fixes failure 4 above: a parametric recipe is resolution-independent, so it evaluates at
+   every LOD instead of vanishing past LOD1.
+4. **Detail.** FBm displacement on the carved surfaces: wall roughness, breakdown, rubble floors, and
+   the short dead-end side passages that lead nowhere and should.
+
+**Noise stops being the structure and becomes the texture.** That is the whole change, and it keeps
+what the current implementation is genuinely good at — the detail layer is still SIMD FBm, still
+strict-FP deterministic, still evaluated only where it is needed.
+
+### Topology is a biome property
+
+What the roster (§5) is already asking for, restated as generator input:
+
+| Biome | Topology class | Character |
+|---|---|---|
+| **The Hollows** | Karst | Multi-level, large chambers, vertical shafts, dolines open to the sky. Dense enough that the cave system *is* the map |
+| **Cinder flats** | Lava tube | Long, smooth, near-constant bore, rarely branching, following the old slope. Few entrances, enormous reach |
+| **The Rime** | Subglacial | Conduits at the ice–bedrock interface, crevasse entrances, melt channels. Entered by falling into them |
+| **Highland** | Fracture | Steep, angular, vertically dominated, short. Alpine caves, as §5 asks |
+| **Fen** | Water table | Shallow, flooded, sinkhole entrances. Short and unpleasant |
+| **Badlands** | Undercut | Barely a cave system: overhangs, alcoves, slot canyons, mostly open to the sky |
+| **Downs** | Shallow | Few, short, safe. The baseline — and the starter region's guaranteed cave (§7) |
+| Everything else | Sparse | A little of the Downs' treatment. The underground is not the point there |
+
+This is the per-biome variation §3 promised was safe. Topology class is a **biome** property and
+never a threat property, so a Hollows at 2 km and a Hollows at 9 km are carved identically and only
+their roster differs. **Cave depth stays available as a threat input** (§3) — which is what makes the
+vertical axis a second progression without generation ever knowing the radius.
+
+### Seeds
+
+Minecraft and No Man's Sky are the references here, and what they imply is sharper than "the world
+has a seed", which is already true.
+
+**The network must be derivable from the seed at the coarse tier, without meshing.** Then a seed is
+searchable for underground properties the way §8 wants it searchable for surface ones — "a Hollows
+with a 200 m shaft within 2 km of spawn", "a lava tube running under the starter region". A seed
+nobody can judge without playing it is not a seed culture.
+
+Two consequences land immediately:
+
+* **§7's validation gains an underground clause.** The starter region's guaranteed shallow cave stops
+  being a hopeful noise threshold and becomes a placement that either happened or did not. So does
+  "every tech tier is reachable", the moment set pieces live in cave networks — which they will.
+* **§8's generator versioning gets stricter, not looser.** A placed network is a larger behavioural
+  surface than two noise fields, so more of it moves when it is tuned, and every change still
+  silently re-bases every `DeltaStore` edit underground. The version pin §8 asks for is more urgent
+  here, not less.
+
+### What this demands of the generator
+
+* A **topology class** per coarse cell, blended at borders, driven by biome — the tunnel pass's real
+  signature, beyond mere density.
+* A **deterministic network builder** per region: seed + region id → graph, with no dependence on
+  evaluation order or thread count.
+* **SDF composition into base density** — capsule chains and ellipsoid unions, smooth-CSG'd against
+  the surface field, evaluable at any LOD.
+* **A cheap graph query API**, because §6's navigation, §7's validation and §8's seed tooling are all
+  customers before a single chunk is meshed. The cave graph is a strong candidate to *be* §6's coarse
+  navigation graph underground, rather than a second structure that has to agree with it.
+* **Caves at every LOD**, retiring `maxCaveLod` and making an entrance something that can be seen
+  before it is stood in.
+* **Entrance placement as a first-class output**, not a shell term. How a player finds the
+  underground is §7's legibility problem one level down, and it is currently answered by a noise
+  field.
+
+**[open]** Where exactly does placement stop and texture begin? Too much placement and every cave is
+a corridor somebody designed; too little and the four failures return wearing a graph. Layer 4's
+dead-end side passages are the test case — they must be noise, and the navigation graph must not
+mistake them for routes.
+
+**[open]** Does the cave graph serve double duty as §6's underground navigation graph? Same topology,
+already deterministic, which makes it very attractive. But creatures path through terrain *as
+edited*, and the graph describes terrain *as generated* — something has to reconcile a tunnel the
+player has walled off.
+
+**[open]** How deep does the underground go? §1 gives 512 m below sea level and §5 makes the Hollows
+the cheap way into it, but nothing says whether the network is one layer, several stacked, or
+continuous to bedrock — and that decides whether depth is a progression or a single step down.
+
+---
+
+## 10. Open questions, ranked
 
 1. **What is the navigation representation?** (§6) Now the critical path, not a future concern.
    Danger is creatures, creatures must path, and permanent 1 m edits rule out static navmesh baking.

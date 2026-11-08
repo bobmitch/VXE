@@ -47,6 +47,17 @@ struct StripeParams {
     float   gain        = 0.4f;    // amplitude multiplier per octave
     float   slopeFeed   = 0.6f;    // how far a gully's own slope steers the next octave
     float   slopeRef    = 0.18f;   // gradient magnitude at which stripes reach full strength
+    // Stacked fading. Without it each octave lays its gullies wherever the
+    // slope allows, including along the crest of the ridge the previous octave
+    // just raised, and the surface reads as lumps rather than drainage. This
+    // biases each octave toward the creases the last one cut: 0 disables it,
+    // 1 puts detail only in creases.
+    float   detailBias  = 0.7f;
+    // Straight gullies. Feeding the raw sine back as the stripe's slope makes
+    // gullies curl away at their ends, because the perturbation dies off just
+    // where the gully should keep running. Blending toward its sign keeps the
+    // turn constant along the stripe so gullies run straight down the slope.
+    float   straightness = 0.7f;
     // Distance over which the incoming gradient is measured. Gullies follow the
     // hillside, not the bumps on it: at a few metres the direction swings with
     // every small feature and the stripes never line up into anything. This
@@ -107,12 +118,16 @@ inline float stripeErosion(const StripeParams& sp, float x, float z, SlopeXZ& gr
     float offset = 0.f;
     float cell = sp.cellSize, width = sp.stripeWidth, amp = sp.amplitude;
     SlopeXZ g = grad;
+    // 1 where the previous octave left a crease, 0 along its ridge. Starts open
+    // so the first octave is unconstrained.
+    float creaseMask = 1.f;
 
     for (int32_t o = 0; o < sp.octaves; ++o) {
         const float len = std::sqrt(g.dx * g.dx + g.dz * g.dz);
         // Flat ground has no flow direction, so stripes there would fold into
         // chaos around peaks and valleys. Fade them out instead.
-        const float fade = smoothstep(0.15f * sp.slopeRef, sp.slopeRef, len);
+        const float steep = smoothstep(0.15f * sp.slopeRef, sp.slopeRef, len);
+        const float fade = steep * lerp(1.f - sp.detailBias, 1.f, creaseMask);
         if (fade > 0.001f) {
             // Downhill, and the across-flow axis the stripes vary along.
             const float inv = 1.f / len;
@@ -152,11 +167,18 @@ inline float stripeErosion(const StripeParams& sp, float x, float z, SlopeXZ& gr
             // unbounded, a steep gully's own slope dwarfs the hillside's and
             // the next octave runs its stripes across this one instead of
             // down it, which cross-hatches the surface into chaos.
+            const float slopeSign = slope >= 0.f ? 1.f : -1.f;
+            const float slopeEff = lerp(slope, slopeSign, sp.straightness);
             const float maxTurn = len * sp.slopeFeed;
-            float dAcross = -amp * slope * (kTwoPi / width) * fade * sp.slopeFeed;
+            float dAcross = -amp * slopeEff * (kTwoPi / width) * fade * sp.slopeFeed;
             dAcross = dAcross < -maxTurn ? -maxTurn : (dAcross > maxTurn ? maxTurn : dAcross);
             g.dx += perpX * dAcross;
             g.dz += perpZ * dAcross;
+
+            // Hand the next octave this one's creases.
+            creaseMask = saturate(0.5f - 0.5f * wave);
+        } else {
+            creaseMask = 1.f;
         }
         cell *= sp.lacunarity;
         width *= sp.lacunarity;

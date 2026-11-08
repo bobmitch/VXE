@@ -28,6 +28,7 @@
 #include "vxe/core/TaskSystem.h"
 #include "vxe/meshing/DualContouring.h"
 #include "vxe/meshing/MeshOptimizerStage.h"
+#include "vxe/render/DensityBrick.h"
 #include "vxe/world/DensityGenerator.h"
 
 #include <memory>
@@ -42,6 +43,13 @@ class DeltaStore;
 
 struct StreamerConfig {
     uint8_t maxLod = 5;                 // 1024 m top-level chunks
+    // Chunks at or above this LOD are not meshed. They emit a DensityBrick
+    // instead, for a renderer that traces the far field rather than drawing it
+    // -- see onChunkDensityReady. They cost no dual contouring, no meshopt and
+    // no vertex or index buffers, and they carry no collision, which is why the
+    // split has to sit beyond anything the player can touch. 255 disables it
+    // and every chunk is meshed, as before.
+    uint8_t traceLod = 255;
     double viewDistance = 4096.0;       // metres
     double splitFactor = 2.0;           // split while dist < factor * chunkSize
     // Hysteresis on that threshold. A single threshold makes the split decision
@@ -87,6 +95,13 @@ public:
     virtual void onChunkMeshReady(const ChunkKey& key, uint32_t version,
                                   const std::shared_ptr<const OptimizedChunkMesh>& mesh) = 0;
     virtual void onChunkRemoved(const ChunkKey& key) = 0;
+    // Far-field chunks (lod >= StreamerConfig::traceLod) arrive here instead of
+    // onChunkMeshReady, carrying density rather than geometry. Null for a chunk
+    // that is entirely solid or entirely air. onChunkRemoved still retires it.
+    virtual void onChunkDensityReady(const ChunkKey& key, uint32_t version,
+                                     const std::shared_ptr<const DensityBrick>& brick) {
+        (void)key; (void)version; (void)brick;
+    }
 };
 
 class ChunkStreamer {
@@ -136,6 +151,7 @@ private:
         double distance = 0.0;
         PoolPtr<DensityField> field{};
         std::shared_ptr<const OptimizedChunkMesh> mesh;
+        std::shared_ptr<const DensityBrick> brick;   // far field, in place of mesh
         ChunkState state() const { return inFlight && !ready ? ChunkState::Building : (ready ? ChunkState::Ready : ChunkState::Pending); }
     };
     struct BuildResult {
@@ -143,6 +159,8 @@ private:
         uint32_t version = 0;
         PoolPtr<DensityField> field{};
         std::shared_ptr<OptimizedChunkMesh> mesh;
+        std::shared_ptr<DensityBrick> brick;
+        bool traced = false;
         bool uniform = false;
         bool generated = false;
     };

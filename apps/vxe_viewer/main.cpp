@@ -298,6 +298,176 @@ float4 PSSky(SkyOut i) : SV_Target
                                            gCamUp    * (i.ndc.y * gTanHalfFovY));
     return float4(pow(saturate(skyColor(dir)), 1.0 / 2.2), 1.0);
 }
+
+// -----------------------------------------------------------------------------
+// Far field. Beyond the meshed shell the terrain is never turned into triangles:
+// the streamer hands those chunks over as density bricks and they are ray
+// marched here instead. Same generator, same DeltaStore, same samples -- only
+// the consumer differs, which is what lets the two halves meet without a seam.
+//
+// The march is two-level. A DDA walks the chunk grid, where a chunk is 256 m or
+// more, so empty sky and deep rock are crossed in one step each; only chunks
+// holding a surface have a brick allocated, and only those are stepped through
+// finely. Inside one, density is close enough to metres to sphere trace on.
+// -----------------------------------------------------------------------------
+cbuffer Far : register(b2)
+{
+    float3 gCamWorld;   float gChunkSizeM;    // metres along a traced chunk edge
+    float3 gWorldMin;   float gVoxelSizeM;    // metres between traced samples
+    float3 gIndexDims;  float gFarStart;      // index volume extent, in chunks
+    float3 gAtlasDims;  float gFarEnd;        // brick atlas extent, in texels
+    float3 gSlotGrid;   float gFarPad;        // brick slots per atlas axis
+};
+Texture3D<uint>   gIndex  : register(t0);
+Texture3D<float2> gAtlas  : register(t1);   // r = density, g = material index
+SamplerState      gLinear : register(s0);
+
+static const float kBrick = 34.0;       // samples per brick edge
+static const float kSpan  = 31.999;     // the chunk's own 32 cells, kept off the far border
+
+float3 slotOrigin(uint slot)
+{
+    const uint gx = uint(gSlotGrid.x), gy = uint(gSlotGrid.y);
+    return float3(float(slot % gx), float((slot / gx) % gy), float(slot / (gx * gy))) * kBrick;
+}
+
+// Brick sample i holds the chunk's local point i-1, so the +1 skips the border.
+float sampleBrick(uint slot, float3 local)
+{
+    const float3 texel = slotOrigin(slot) + local + 1.0;
+    const float s = gAtlas.SampleLevel(gLinear, (texel + 0.5) / gAtlasDims, 0).r;
+    return (s - 0.5) * 16.0;            // unorm8 over [-8, +8] metres
+}
+
+// Material is a palette index, so it is point loaded: interpolating between
+// grass and rock would invent a material that is neither.
+uint materialAt(uint slot, float3 local)
+{
+    const int3 texel = int3(slotOrigin(slot) + round(local) + 1.0);
+    return uint(gAtlas.Load(int4(texel, 0)).g * 255.0 + 0.5);
+}
+
+float3 brickNormal(uint slot, float3 chunkOrigin, float3 p)
+{
+    const float3 l = (p - chunkOrigin) / gVoxelSizeM;
+    const float3 e = float3(0.6, 0.0, 0.0);
+    const float dx = sampleBrick(slot, clamp(l + e.xyy, 0.0, kSpan)) - sampleBrick(slot, clamp(l - e.xyy, 0.0, kSpan));
+    const float dy = sampleBrick(slot, clamp(l + e.yxy, 0.0, kSpan)) - sampleBrick(slot, clamp(l - e.yxy, 0.0, kSpan));
+    const float dz = sampleBrick(slot, clamp(l + e.yyx, 0.0, kSpan)) - sampleBrick(slot, clamp(l - e.yyx, 0.0, kSpan));
+    // Density rises toward air, so its gradient already points out of the rock.
+    return normalize(float3(dx, dy, dz) + float3(0.0, 1e-5, 0.0));
+}
+
+bool traceFar(float3 rd, out float3 outHit, out float3 outNrm, out uint outMat)
+{
+    outHit = 0.0;
+    outNrm = float3(0, 1, 0);
+    outMat = 3;                                  // rock, if nothing else says otherwise
+    const float3 ro = gCamWorld;
+    const float3 ip = (ro - gWorldMin) / gChunkSizeM;     // ray in chunk units
+    const float3 id = rd / gChunkSizeM;
+
+    float t = gFarStart;
+    int3 cell = int3(floor(ip + id * t));
+    const int3 stepDir = int3(id.x >= 0 ? 1 : -1, id.y >= 0 ? 1 : -1, id.z >= 0 ? 1 : -1);
+    const float3 dt = 1.0 / max(abs(id), 1e-20);          // t spent crossing one chunk
+    float3 next;
+    [unroll] for (int k = 0; k < 3; ++k) {
+        const float cur = ip[k] + id[k] * t;
+        const float bound = float(cell[k]) + (stepDir[k] > 0 ? 1.0 : 0.0);
+        next[k] = abs(id[k]) < 1e-20 ? 1e30 : t + (bound - cur) / id[k];
+    }
+
+    [loop] for (int iter = 0; iter < 160 && t < gFarEnd; ++iter) {
+        if (all(cell >= int3(0, 0, 0)) && all(cell < int3(gIndexDims))) {
+            const uint slot = gIndex.Load(int4(cell, 0));
+            if (slot != 0xFFFFFFFFu) {
+                const float tExit = min(min(next.x, min(next.y, next.z)), gFarEnd);
+                const float3 chunkOrigin = gWorldMin + float3(cell) * gChunkSizeM;
+                float s = t;
+                [loop] for (int j = 0; j < 96 && s < tExit; ++j) {
+                    const float3 l = clamp((ro + rd * s - chunkOrigin) / gVoxelSizeM, 0.0, kSpan);
+                    const float d = sampleBrick(slot, l);
+                    if (d < 0.0) {
+                        float lo = max(s - gVoxelSizeM, t), hi = s;
+                        [unroll] for (int b = 0; b < 6; ++b) {
+                            const float mid = 0.5 * (lo + hi);
+                            const float3 lm = clamp((ro + rd * mid - chunkOrigin) / gVoxelSizeM, 0.0, kSpan);
+                            if (sampleBrick(slot, lm) < 0.0) hi = mid; else lo = mid;
+                        }
+                        outHit = ro + rd * hi;
+                        outNrm = brickNormal(slot, chunkOrigin, outHit);
+                        // Read the material a full voxel inside the surface. On
+                        // it, or just under it, the nearest sample is as likely
+                        // to be the air above -- which reads as a speckle of
+                        // the wrong colour all over anything steep.
+                        const float3 inside = outHit - outNrm * gVoxelSizeM;
+                        outMat = materialAt(slot, clamp((inside - chunkOrigin) / gVoxelSizeM, 0.0, kSpan));
+                        if (outMat == 0u) outMat = 3u;   // air: the tap missed, call it rock
+                        return true;
+                    }
+                    // Density is near enough to a distance to step on, floored so
+                    // a grazing ray cannot stall inside one voxel. The floor
+                    // also opens with distance: a step finer than the pixel the
+                    // ray covers buys nothing, and a ray skimming a ridge for a
+                    // kilometre is where the whole march budget goes.
+                    s += max(max(d * 0.8, gVoxelSizeM * 0.35), s * 0.0045);
+                }
+            }
+        }
+        if (next.x < next.y && next.x < next.z)      { t = next.x; cell.x += stepDir.x; next.x += dt.x; }
+        else if (next.y < next.z)                    { t = next.y; cell.y += stepDir.y; next.y += dt.y; }
+        else                                         { t = next.z; cell.z += stepDir.z; next.z += dt.z; }
+
+        // Out of the volume and heading further out: nothing can be hit from
+        // here. Without this a ray into the sky leaves the 8-cell-tall index
+        // after a step or two and then spends its whole iteration budget
+        // walking empty space, which is most of the pixels in a level view.
+        const int3 dim = int3(gIndexDims);
+        if ((cell.x < 0 && stepDir.x < 0) || (cell.x >= dim.x && stepDir.x > 0) ||
+            (cell.y < 0 && stepDir.y < 0) || (cell.y >= dim.y && stepDir.y > 0) ||
+            (cell.z < 0 && stepDir.z < 0) || (cell.z >= dim.z && stepDir.z > 0)) break;
+    }
+    return false;
+}
+
+float4 PSFar(SkyOut i) : SV_Target
+{
+    const float3 dir = normalize(gCamFwd + gCamRight * (i.ndc.x * gTanHalfFovX) +
+                                           gCamUp    * (i.ndc.y * gTanHalfFovY));
+    float3 hit, n;
+    uint mat;
+    // Returning the sky rather than discarding, deliberately. A shader that can
+    // discard cannot be depth-rejected before it runs, so `discard` here made
+    // every pixel on screen march -- including the ~70% already covered by the
+    // meshed near field, whose depth would otherwise have killed them for free.
+    // This pass only runs where the depth test passes, which is where the sky
+    // is, so writing the sky back costs nothing and buys early-Z.
+    if (!traceFar(dir, hit, n, mat))
+        return float4(pow(saturate(skyColor(dir)), 1.0 / 2.2), 1.0);
+
+    const float3 camRel = hit - gCamWorld;
+    const float  dist   = length(camRel);
+    const float3 v      = -dir;
+
+    // The same palette the meshed path indexes, so the two halves of the
+    // landscape are not merely the same shape but the same colour.
+    float3 albedo = lerp(gMaterial[min(mat, 7u)].rgb, kLodTint[6], gLodTint);
+    const float  ndl = saturate(dot(n, gSunDir));
+    const float3 sun = gSunColor * ndl;
+    const float3 amb = lerp(float3(0.10, 0.10, 0.12), gSkyTop * 0.55, saturate(n.y * 0.5 + 0.5));
+    const float3 h   = normalize(gSunDir + v);
+    const float  spec = pow(saturate(dot(n, h)), 24.0) * 0.06 * ndl;
+    float3 color = albedo * (sun + amb) + spec;
+
+    // Identical fog and tonemap to the meshed path, or the handover would show
+    // as a change in haze rather than a change in geometry.
+    const float heightFalloff = clamp(exp(-camRel.y * 0.0012), 0.55, 1.8);
+    const float fog = 1.0 - exp(-dist * gFogDensity * heightFalloff);
+    color = lerp(color, skyColor(dir), saturate(fog));
+    color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
+    return float4(pow(saturate(color), 1.0 / 2.2), 1.0);
+}
 )HLSL";
 
 // -----------------------------------------------------------------------------
@@ -501,6 +671,196 @@ private:
 };
 
 // -----------------------------------------------------------------------------
+// Far-field brick store. Chunks at or beyond StreamerConfig::traceLod arrive
+// here as density instead of geometry. They live in a GPU brick atlas indexed
+// by a world-anchored volume of slot ids, which is what the trace shader walks:
+// one texel per chunk of the world at that LOD, holding either a slot or
+// "nothing here". Slots recycle as chunks come and go, so the atlas is sized
+// for peak residency rather than for the world.
+//
+// Only chunks with a surface in them ever get a slot -- open sky and deep rock
+// reduce to a single empty texel, which is what makes the ray able to cross a
+// kilometre of nothing in a couple of steps.
+// -----------------------------------------------------------------------------
+class FarFieldBricks final : public IChunkListener {
+public:
+    static constexpr int kSlotsX = 16, kSlotsY = 16, kSlotsZ = 8;      // 2048 bricks
+    static constexpr uint32_t kSlotCount = uint32_t(kSlotsX) * kSlotsY * kSlotsZ;
+    static constexpr uint32_t kEmpty = 0xFFFFFFFFu;
+
+    FarFieldBricks(ID3D11Device* device, uint8_t traceLod) : m_device(device), m_lod(traceLod) {}
+
+    bool init() {
+        const int32_t cs = chunkSizeVoxels();
+        m_base = {floorDiv(-world::kWorldHalfExtentXZ, cs), floorDiv(world::kWorldMinY, cs),
+                  floorDiv(-world::kWorldHalfExtentXZ, cs)};
+        m_dim = {floorDiv(world::kWorldHalfExtentXZ, cs) - m_base.x + 1,
+                 floorDiv(world::kWorldMaxY, cs) - m_base.y + 1,
+                 floorDiv(world::kWorldHalfExtentXZ, cs) - m_base.z + 1};
+
+        m_index.assign(size_t(m_dim.x) * size_t(m_dim.y) * size_t(m_dim.z), kEmpty);
+        for (uint32_t i = 0; i < kSlotCount; ++i) m_free.push_back(kSlotCount - 1 - i);
+
+        D3D11_TEXTURE3D_DESC id{};
+        id.Width = UINT(m_dim.x); id.Height = UINT(m_dim.y); id.Depth = UINT(m_dim.z);
+        id.MipLevels = 1;
+        id.Format = DXGI_FORMAT_R32_UINT;
+        id.Usage = D3D11_USAGE_DEFAULT;
+        id.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        // Must start as "nothing here" everywhere: a texture created without
+        // initial data holds garbage, and a garbage slot id sends the ray into
+        // an arbitrary brick.
+        D3D11_SUBRESOURCE_DATA init{};
+        init.pSysMem = m_index.data();
+        init.SysMemPitch = UINT(sizeof(uint32_t) * size_t(m_dim.x));
+        init.SysMemSlicePitch = init.SysMemPitch * UINT(m_dim.y);
+        if (FAILED(m_device->CreateTexture3D(&id, &init, m_indexTex.put()))) return false;
+        if (FAILED(m_device->CreateShaderResourceView(m_indexTex.get(), nullptr, m_indexSrv.put()))) return false;
+
+        D3D11_TEXTURE3D_DESC ad{};
+        ad.Width = UINT(kSlotsX * kBrickSize); ad.Height = UINT(kSlotsY * kBrickSize);
+        ad.Depth = UINT(kSlotsZ * kBrickSize);
+        ad.MipLevels = 1;
+        ad.Format = DXGI_FORMAT_R8G8_UNORM;   // r = density, g = material index
+        ad.Usage = D3D11_USAGE_DEFAULT;
+        ad.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(m_device->CreateTexture3D(&ad, nullptr, m_atlasTex.put()))) return false;
+        if (FAILED(m_device->CreateShaderResourceView(m_atlasTex.get(), nullptr, m_atlasSrv.put()))) return false;
+
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        return SUCCEEDED(m_device->CreateSamplerState(&sd, m_sampler.put()));
+    }
+
+    // --- IChunkListener -----------------------------------------------------
+    void onChunkMeshReady(const ChunkKey&, uint32_t, const std::shared_ptr<const OptimizedChunkMesh>&) override {}
+
+    void onChunkDensityReady(const ChunkKey& key, uint32_t version,
+                             const std::shared_ptr<const DensityBrick>& brick) override {
+        if (!brick) { m_pendingRemoval.push_back(key); return; }   // uniform: nothing to trace
+        m_latest[key] = version;
+        m_pending.push_back({key, version, brick});
+    }
+    void onChunkRemoved(const ChunkKey& key) override {
+        m_latest.erase(key);
+        m_pendingRemoval.push_back(key);
+    }
+
+    uint32_t flushUploads(ID3D11DeviceContext* ctx, uint32_t budget) {
+        for (const ChunkKey& k : m_pendingRemoval) release(ctx, k);
+        m_pendingRemoval.clear();
+
+        uint32_t made = 0;
+        while (made < budget && !m_pending.empty()) {
+            Upload up = std::move(m_pending.front());
+            m_pending.pop_front();
+            const auto latest = m_latest.find(up.key);
+            if (latest == m_latest.end() || latest->second != up.version) continue;   // superseded
+            if (upload(ctx, up)) { ++made; ++m_totalUploads; }
+        }
+        return made;
+    }
+
+    uint64_t totalUploads() const { return m_totalUploads; }
+
+    void bind(ID3D11DeviceContext* ctx) const {
+        ID3D11ShaderResourceView* srvs[2] = {m_indexSrv.get(), m_atlasSrv.get()};
+        ctx->PSSetShaderResources(0, 2, srvs);
+        ID3D11SamplerState* samplers[1] = {m_sampler.get()};
+        ctx->PSSetSamplers(0, 1, samplers);
+    }
+    static void unbind(ID3D11DeviceContext* ctx) {
+        ID3D11ShaderResourceView* none[2] = {nullptr, nullptr};
+        ctx->PSSetShaderResources(0, 2, none);
+    }
+
+    size_t resident() const { return m_slotOf.size(); }
+    size_t pendingUploads() const { return m_pending.size(); }
+    size_t atlasBytes() const {
+        return size_t(kSlotsX * kBrickSize) * size_t(kSlotsY * kBrickSize) * size_t(kSlotsZ * kBrickSize);
+    }
+    size_t usedBytes() const { return m_slotOf.size() * size_t(kBrickVolume); }
+    bool overflowed() const { return m_overflow; }
+    Vec3i indexDim() const { return m_dim; }
+    Vec3d indexOriginWorld() const {
+        const double cs = double(chunkSizeVoxels()) * world::kVoxelSize;
+        return {double(m_base.x) * cs, double(m_base.y) * cs, double(m_base.z) * cs};
+    }
+    int32_t chunkSizeVoxels() const { return world::kChunkCells << m_lod; }
+
+private:
+    struct Upload {
+        ChunkKey key;
+        uint32_t version;
+        std::shared_ptr<const DensityBrick> brick;
+    };
+
+    bool inRange(const Vec3i& c) const {
+        return c.x >= 0 && c.y >= 0 && c.z >= 0 && c.x < m_dim.x && c.y < m_dim.y && c.z < m_dim.z;
+    }
+    Vec3i cellOf(const ChunkKey& key) const { return {key.x - m_base.x, key.y - m_base.y, key.z - m_base.z}; }
+    size_t flat(const Vec3i& c) const { return size_t(c.x) + size_t(m_dim.x) * (size_t(c.y) + size_t(m_dim.y) * size_t(c.z)); }
+
+    void writeIndex(ID3D11DeviceContext* ctx, const Vec3i& c, uint32_t value) {
+        m_index[flat(c)] = value;
+        const D3D11_BOX box{UINT(c.x), UINT(c.y), UINT(c.z), UINT(c.x) + 1, UINT(c.y) + 1, UINT(c.z) + 1};
+        ctx->UpdateSubresource(m_indexTex.get(), 0, &box, &value, sizeof(uint32_t), sizeof(uint32_t));
+    }
+
+    bool upload(ID3D11DeviceContext* ctx, const Upload& up) {
+        const Vec3i cell = cellOf(up.key);
+        if (!inRange(cell)) return false;
+
+        auto it = m_slotOf.find(up.key);
+        uint32_t slot;
+        if (it != m_slotOf.end()) {
+            slot = it->second;                       // rebuilt in place after an edit
+        } else {
+            if (m_free.empty()) { m_overflow = true; return false; }
+            slot = m_free.back();
+            m_free.pop_back();
+            m_slotOf.emplace(up.key, slot);
+        }
+
+        const UINT sx = UINT((slot % kSlotsX) * kBrickSize);
+        const UINT sy = UINT(((slot / kSlotsX) % kSlotsY) * kBrickSize);
+        const UINT sz = UINT((slot / (kSlotsX * kSlotsY)) * kBrickSize);
+        const D3D11_BOX box{sx, sy, sz, sx + UINT(kBrickSize), sy + UINT(kBrickSize), sz + UINT(kBrickSize)};
+        ctx->UpdateSubresource(m_atlasTex.get(), 0, &box, up.brick->texels.data(), UINT(kBrickSize) * 2,
+                               UINT(kBrickSize * kBrickSize) * 2);
+        writeIndex(ctx, cell, slot);
+        return true;
+    }
+
+    void release(ID3D11DeviceContext* ctx, const ChunkKey& key) {
+        auto it = m_slotOf.find(key);
+        if (it == m_slotOf.end()) return;
+        const Vec3i cell = cellOf(key);
+        if (inRange(cell)) writeIndex(ctx, cell, kEmpty);
+        m_free.push_back(it->second);
+        m_slotOf.erase(it);
+    }
+
+    ID3D11Device* m_device;
+    uint8_t m_lod;
+    Vec3i m_base{}, m_dim{};
+    std::vector<uint32_t> m_index;
+    std::vector<uint32_t> m_free;
+    std::unordered_map<ChunkKey, uint32_t, ChunkKeyHash> m_slotOf;
+    std::unordered_map<ChunkKey, uint32_t, ChunkKeyHash> m_latest;
+    std::deque<Upload> m_pending;
+    std::vector<ChunkKey> m_pendingRemoval;
+    Com<ID3D11Texture3D> m_indexTex, m_atlasTex;
+    Com<ID3D11ShaderResourceView> m_indexSrv, m_atlasSrv;
+    Com<ID3D11SamplerState> m_sampler;
+    uint64_t m_totalUploads = 0;
+    bool m_overflow = false;
+};
+
+// -----------------------------------------------------------------------------
 // Constant buffer layouts (must match the HLSL above)
 // -----------------------------------------------------------------------------
 struct FrameCB {
@@ -520,6 +880,15 @@ struct ChunkCB {
     float offset[3];
     float lod;
 };
+
+struct FarCB {
+    float camWorld[3];  float chunkSizeM;
+    float worldMin[3];  float voxelSizeM;
+    float indexDims[3]; float farStart;
+    float atlasDims[3]; float farEnd;
+    float slotGrid[3];  float pad;
+};
+static_assert(sizeof(FarCB) % 16 == 0);
 
 // -----------------------------------------------------------------------------
 // Input state
@@ -714,6 +1083,8 @@ int main(int argc, char** argv) {
     double exitAfter = 0.0;         // 0 = run until closed
     bool startLodTint = false, startWireframe = false, startFlyby = true;
     float skirtCells = -1.f;        // < 0 = leave the StreamerConfig default alone
+    bool farTrace = false;          // mesh the near field, ray march the rest
+    int traceLod = 3;               // first LOD handed over as density instead of geometry
     bool fixedCam = false;
     double camArgs[5] = {};         // x y z yaw pitch (degrees)
     for (int i = 1; i < argc; ++i) {
@@ -732,6 +1103,8 @@ int main(int argc, char** argv) {
         else if (a == "--wireframe") startWireframe = true;
         else if (a == "--free") startFlyby = false;
         else if (a == "--no-skirts") skirtCells = 0.f;
+        else if (a == "--far-trace") farTrace = true;
+        else if (a == "--trace-lod") traceLod = int(next(traceLod));
         else if (a == "--skirt") skirtCells = float(next(4.5));
         else if (a == "--cam") {
             for (double& v : camArgs) v = next(0.0);
@@ -863,17 +1236,20 @@ int main(int argc, char** argv) {
         return !fail(r, "D3DCompile");
     };
 
-    Com<ID3DBlob> vsBlob, psBlob, skyVsBlob, skyPsBlob;
+    Com<ID3DBlob> vsBlob, psBlob, skyVsBlob, skyPsBlob, farPsBlob;
     if (!compile("VSMain", "vs_5_0", vsBlob) || !compile("PSMain", "ps_5_0", psBlob) ||
         !compile("VSSky", "vs_5_0", skyVsBlob) || !compile("PSSky", "ps_5_0", skyPsBlob))
         return 1;
+    if (farTrace && !compile("PSFar", "ps_5_0", farPsBlob)) return 1;
 
     Com<ID3D11VertexShader> vs, skyVs;
-    Com<ID3D11PixelShader> ps, skyPs;
+    Com<ID3D11PixelShader> ps, skyPs, farPs;
     device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, vs.put());
     device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, ps.put());
     device->CreateVertexShader(skyVsBlob->GetBufferPointer(), skyVsBlob->GetBufferSize(), nullptr, skyVs.put());
     device->CreatePixelShader(skyPsBlob->GetBufferPointer(), skyPsBlob->GetBufferSize(), nullptr, skyPs.put());
+    if (farPsBlob) device->CreatePixelShader(farPsBlob->GetBufferPointer(), farPsBlob->GetBufferSize(), nullptr,
+                                             farPs.put());
 
     // Matches vxe::TerrainVertex exactly, so mesher output uploads without a copy.
     static_assert(sizeof(TerrainVertex) == 28, "TerrainVertex layout changed; update the input elements");
@@ -896,8 +1272,9 @@ int main(int argc, char** argv) {
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         return !fail(device->CreateBuffer(&bd, nullptr, out.put()), "CreateBuffer(constant)");
     };
-    Com<ID3D11Buffer> frameCB, chunkCB;
+    Com<ID3D11Buffer> frameCB, chunkCB, farCB;
     if (!makeCB(sizeof(FrameCB), frameCB) || !makeCB(sizeof(ChunkCB), chunkCB)) return 1;
+    if (farTrace && !makeCB(sizeof(FarCB), farCB)) return 1;
 
     // DualContouring winds each quad so the right-hand-rule normal points out of
     // the solid. With this LH projection that is clockwise on screen for a face
@@ -924,6 +1301,15 @@ int main(int argc, char** argv) {
     dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
     Com<ID3D11DepthStencilState> dssSky;
     device->CreateDepthStencilState(&dsd, dssSky.put());
+    // The far field is drawn as a fullscreen pass after the meshed near field,
+    // at depth 0. Under reverse-Z that is the far plane, so GREATER_EQUAL keeps
+    // only the pixels no triangle reached -- the ray is never marched behind
+    // terrain that is already on screen.
+    dsd.DepthEnable = TRUE;
+    dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    dsd.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
+    Com<ID3D11DepthStencilState> dssFar;
+    device->CreateDepthStencilState(&dsd, dssFar.put());
 
     // ---- Engine --------------------------------------------------------------
     TaskSystem tasks;
@@ -941,10 +1327,26 @@ int main(int argc, char** argv) {
         sc.mesherLod0.skirtDepthCells = skirtCells;
         sc.mesherFar.skirtDepthCells = skirtCells;
     }
+    if (farTrace) {
+        traceLod = std::clamp(traceLod, 1, maxLod);
+        sc.traceLod = uint8_t(traceLod);
+    }
     ChunkStreamer streamer(tasks, generator, deltas, sc);
 
     ChunkGpuRegistry gpuChunks(device.get());
     streamer.addListener(&gpuChunks);
+
+    FarFieldBricks farBricks(device.get(), uint8_t(traceLod));
+    if (farTrace) {
+        if (!farBricks.init()) { std::fprintf(stderr, "far-field brick store failed to initialise\n"); return 1; }
+        streamer.addListener(&farBricks);
+        // Where the meshed shell ends: chunks finer than traceLod are split
+        // while within splitFactor * their size, so this is the radius inside
+        // which triangles exist -- and therefore where the ray may start.
+        std::printf("far field  : LOD >= %d traced, meshed shell ends at %.0f m, atlas %zu MB for %u bricks\n",
+                    traceLod, sc.splitFactor * double(world::kChunkCells << traceLod) * world::kVoxelSize,
+                    farBricks.atlasBytes() / (1024 * 1024), FarFieldBricks::kSlotCount);
+    }
 
     Terraformer terraformer(streamer, generator, deltas);
     VoxelTerrainQuery terrainQuery(streamer, deltas, generator);
@@ -1160,6 +1562,7 @@ int main(int argc, char** argv) {
         // First frames take everything so the opening shot is not half-empty;
         // after that the budget keeps a burst of completed chunks from hitching.
         gpuChunks.flushUploads(frameIndex < 4 ? 4096u : 32u);
+        if (farTrace) farBricks.flushUploads(ctx.get(), frameIndex < 4 ? 4096u : 64u);
         materials.update(dt);
 
         // ---- Render ------------------------------------------------------------
@@ -1248,6 +1651,47 @@ int main(int argc, char** argv) {
             trianglesDrawn += e.indexCount / 3;
         }
 
+        // Far field, last: a fullscreen pass that only touches pixels the
+        // meshed shell left as sky, so the ray is never marched behind
+        // geometry that already won the depth test.
+        if (farTrace && farPs.get()) {
+            const Vec3i dim = farBricks.indexDim();
+            const Vec3d org = farBricks.indexOriginWorld();
+            const float chunkM = float(farBricks.chunkSizeVoxels()) * world::kVoxelSize;
+            FarCB fcb{};
+            fcb.camWorld[0] = float(camera.position.x);
+            fcb.camWorld[1] = float(camera.position.y);
+            fcb.camWorld[2] = float(camera.position.z);
+            fcb.chunkSizeM = chunkM;
+            fcb.worldMin[0] = float(org.x); fcb.worldMin[1] = float(org.y); fcb.worldMin[2] = float(org.z);
+            fcb.voxelSizeM = float(1 << traceLod) * world::kVoxelSize;
+            fcb.indexDims[0] = float(dim.x); fcb.indexDims[1] = float(dim.y); fcb.indexDims[2] = float(dim.z);
+            fcb.farStart = 0.f;              // nothing is bricked inside the meshed shell anyway
+            fcb.atlasDims[0] = float(FarFieldBricks::kSlotsX * kBrickSize);
+            fcb.atlasDims[1] = float(FarFieldBricks::kSlotsY * kBrickSize);
+            fcb.atlasDims[2] = float(FarFieldBricks::kSlotsZ * kBrickSize);
+            fcb.farEnd = float(viewDistance);
+            fcb.slotGrid[0] = float(FarFieldBricks::kSlotsX);
+            fcb.slotGrid[1] = float(FarFieldBricks::kSlotsY);
+            fcb.slotGrid[2] = float(FarFieldBricks::kSlotsZ);
+
+            D3D11_MAPPED_SUBRESOURCE map{};
+            ctx->Map(farCB.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
+            std::memcpy(map.pData, &fcb, sizeof(fcb));
+            ctx->Unmap(farCB.get(), 0);
+            ID3D11Buffer* farCbs[] = {farCB.get()};
+            ctx->PSSetConstantBuffers(2, 1, farCbs);
+
+            farBricks.bind(ctx.get());
+            ctx->IASetInputLayout(nullptr);
+            ctx->OMSetDepthStencilState(dssFar.get(), 0);
+            ctx->RSSetState(rsNoCull.get());
+            ctx->VSSetShader(skyVs.get(), nullptr, 0);
+            ctx->PSSetShader(farPs.get(), nullptr, 0);
+            ctx->Draw(3, 0);
+            FarFieldBricks::unbind(ctx.get());
+        }
+
         // Capture before Present: with FLIP_DISCARD the back buffer's contents
         // are undefined afterwards.
         if (!shotPath.empty() && !shotTaken && runTime >= shotAt) {
@@ -1288,6 +1732,11 @@ int main(int argc, char** argv) {
     std::printf("final camera: (%.1f, %.1f, %.1f) yaw %.1f deg pitch %.1f deg, mode %s\n", camera.position.x,
                 camera.position.y, camera.position.z, camera.yaw * 57.2957795f, camera.pitch * 57.2957795f,
                 flyby ? "flyby" : "free");
+    if (farTrace)
+        std::printf("far field   : %zu bricks resident (%zu MB of a %zu MB atlas), %llu uploads over %llu frames%s\n",
+                    farBricks.resident(), farBricks.usedBytes() / (1024 * 1024),
+                    farBricks.atlasBytes() / (1024 * 1024), (unsigned long long)farBricks.totalUploads(),
+                    (unsigned long long)frameIndex, farBricks.overflowed() ? "  [ATLAS OVERFLOWED]" : "");
     std::printf("frame time  : %.3f ms mean over %llu frames (%.1f fps)%s\n", runTime * 1000.0 / double(frameIndex),
                 (unsigned long long)frameIndex, double(frameIndex) / runTime, vsync ? " [vsync on]" : "");
     CoUninitialize();

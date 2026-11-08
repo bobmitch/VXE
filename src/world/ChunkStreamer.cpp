@@ -224,6 +224,8 @@ bool ChunkStreamer::dispatch(Record& r) {
         PoolPtr<DensityField> field;
         ChunkMesh raw;
         std::shared_ptr<OptimizedChunkMesh> optimized = std::make_shared<OptimizedChunkMesh>();
+        std::shared_ptr<DensityBrick> brick;    // far field: density instead of geometry
+        bool traced = false;
         bool uniform = false;
     };
 
@@ -236,6 +238,7 @@ bool ChunkStreamer::dispatch(Record& r) {
     ctx->version = r.requestedVersion = ++m_nextVersion;
     ctx->keepField = r.key.lod == 0 && !canRemesh;
     ctx->generate = !canRemesh;
+    ctx->traced = r.key.lod >= m_config.traceLod;
     if (canRemesh) std::memcpy(field.get(), r.field.get(), sizeof(DensityField));   // snapshot; main owns r.field
     ctx->field = std::move(field);
 
@@ -267,19 +270,30 @@ bool ChunkStreamer::dispatch(Record& r) {
     }
 
     TaskHandle tMesh = m_tasks.submit([ctx, mesher] {
-        if (!ctx->uniform)
+        if (ctx->traced) {
+            // Far field: requantise the samples the ray tracer needs and skip
+            // contouring entirely. No triangles are produced for this chunk.
+            if (!ctx->uniform) {
+                auto brick = std::make_shared<DensityBrick>();
+                fillBrick(*ctx->field, *brick);
+                if (!brick->uniform) ctx->brick = std::move(brick);
+            }
+        } else if (!ctx->uniform) {
             contourChunk(*ctx->field, float(ctx->key.strideVoxels()) * world::kVoxelSize, mesher, ctx->raw);
+        }
         // Uniform LOD0 fields are not kept resident (memory); edits regenerate them.
         if (!ctx->keepField || ctx->uniform) ctx->field.reset();
     }, prio, {tGen}, "chunk.contour");
 
     TaskHandle tOpt = m_tasks.submit([ctx, meshOpt, results] {
-        optimizeChunkMesh(std::move(ctx->raw), meshOpt, *ctx->optimized);
+        if (!ctx->traced) optimizeChunkMesh(std::move(ctx->raw), meshOpt, *ctx->optimized);
         BuildResult res;
         res.key = ctx->key;
         res.version = ctx->version;
         res.field = std::move(ctx->field);
         res.mesh = std::move(ctx->optimized);
+        res.brick = std::move(ctx->brick);
+        res.traced = ctx->traced;
         res.uniform = ctx->uniform;
         res.generated = ctx->generate;
         results->push(std::move(res));
@@ -315,7 +329,12 @@ void ChunkStreamer::integrateResults() {
         }
         r.mesh = std::move(res.mesh);
         ++m_stats.chunksBuilt;
-        for (auto* l : m_listeners) l->onChunkMeshReady(r.key, r.completedVersion, r.mesh);
+        if (res.traced) {
+            r.brick = std::move(res.brick);
+            for (auto* l : m_listeners) l->onChunkDensityReady(r.key, r.completedVersion, r.brick);
+        } else {
+            for (auto* l : m_listeners) l->onChunkMeshReady(r.key, r.completedVersion, r.mesh);
+        }
     }
 }
 

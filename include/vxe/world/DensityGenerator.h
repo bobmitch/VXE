@@ -27,6 +27,7 @@
 // -----------------------------------------------------------------------------
 
 #include "vxe/world/DensityField.h"
+#include "vxe/world/StripeErosion.h"
 
 #include <memory>
 
@@ -93,6 +94,14 @@ struct TerrainParams {
     // cannot be seen from the >= 256 m such a chunk implies, because there is
     // rock in the way.
     float coarseCaveDepth = 160.f;
+
+    // Gradient-aligned stripe erosion over the column heights: gullies and
+    // ridges that follow the slope, in place of the hills FBm doing all the
+    // mid-scale work. Off by default, because switching it on moves every
+    // height in the world and so re-bases every DeltaStore edit -- it is a
+    // generator version change in the sense §8 of docs/world-design.md means.
+    bool stripeErosion = false;
+    StripeParams stripe{};
 };
 
 struct ChunkGenStats {
@@ -129,6 +138,10 @@ public:
     const char* backendName() const;
 
 private:
+    // Gradient of the unfiltered height at a fixed world-space epsilon, which
+    // is what keeps the gully pattern identical at every LOD.
+    SlopeXZ baseGradient(float x, float z) const;
+
     struct Impl;
     TerrainParams m_params;
     std::unique_ptr<Impl> m_impl;

@@ -158,10 +158,12 @@ private:
 struct Scratch {
     std::vector<float> continental, mountainMask, ridge, hills, entrance;
     std::vector<float> height, mask01, entrance01;
+    std::vector<float> gradA, gradB, gradC, gradD, heightDx, heightDz;   // stripe erosion only
     std::vector<float> overhang, caveA, caveB, cheese;
     Scratch()
         : continental(kCols), mountainMask(kCols), ridge(kCols), hills(kCols), entrance(kCols),
           height(kCols), mask01(kCols), entrance01(kCols),
+          gradA(kCols), gradB(kCols), gradC(kCols), gradD(kCols), heightDx(kCols), heightDz(kCols),
           overhang(size_t(kFieldVolume)), caveA(size_t(kFieldVolume)), caveB(size_t(kFieldVolume)),
           cheese(size_t(kFieldVolume)) {}
 };
@@ -296,15 +298,47 @@ ChunkGenStats DensityGenerator::generate(const ChunkKey& key, DensityField& out)
     m_impl->hills.grid2D(sc.hills.data(), x0, z0, S, step, seed);
     m_impl->entrance.grid2D(sc.entrance.data(), x0, z0, S, step, seed);
 
-    float minH = 1e30f, maxH = -1e30f;
     for (int32_t i = 0; i < kCols; ++i) {
         const ColumnShape c = shapeColumn(p, sc.continental[size_t(i)], sc.mountainMask[size_t(i)], sc.ridge[size_t(i)],
                                           sc.hills[size_t(i)], sc.entrance[size_t(i)]);
         sc.height[size_t(i)] = c.height;
         sc.mask01[size_t(i)] = c.mask;
         sc.entrance01[size_t(i)] = c.entrance;
-        minH = std::min(minH, c.height);
-        maxH = std::max(maxH, c.height);
+    }
+
+    // ---- Stripe erosion ---------------------------------------------------
+    // The filter needs the gradient of the unfiltered height. Taking it from
+    // this chunk's own grid would measure it over the sample spacing -- 1 m at
+    // LOD0, 8 m at LOD3 -- and the gullies would then be a different shape at
+    // every level and change under you at each transition. Two extra grids at a
+    // fixed epsilon make it a pure function of world position instead.
+    if (p.stripeErosion) {
+        const float kGradEps = p.stripe.gradEps;
+        const auto heightsAt = [&](float ox, float oz, std::vector<float>& out) {
+            m_impl->continental.grid2D(sc.gradA.data(), ox, oz, S, step, seed);
+            m_impl->mountainMask.grid2D(sc.gradB.data(), ox, oz, S, step, seed);
+            m_impl->ridge.grid2D(sc.gradC.data(), ox, oz, S, step, seed);
+            m_impl->hills.grid2D(sc.gradD.data(), ox, oz, S, step, seed);
+            for (int32_t i = 0; i < kCols; ++i)   // `entrance` does not reach height
+                out[size_t(i)] = shapeColumn(p, sc.gradA[size_t(i)], sc.gradB[size_t(i)], sc.gradC[size_t(i)],
+                                             sc.gradD[size_t(i)], 0.f).height;
+        };
+        heightsAt(x0 + kGradEps, z0, sc.heightDx);
+        heightsAt(x0, z0 + kGradEps, sc.heightDz);
+
+        for (int32_t zi = 0; zi < S; ++zi)
+            for (int32_t xi = 0; xi < S; ++xi) {
+                const size_t i = size_t(xi + S * zi);
+                const float h = sc.height[i];
+                SlopeXZ g{(sc.heightDx[i] - h) * (1.f / kGradEps), (sc.heightDz[i] - h) * (1.f / kGradEps)};
+                sc.height[i] = h + stripeErosion(p.stripe, x0 + float(xi) * step, z0 + float(zi) * step, g);
+            }
+    }
+
+    float minH = 1e30f, maxH = -1e30f;
+    for (int32_t i = 0; i < kCols; ++i) {
+        minH = std::min(minH, sc.height[size_t(i)]);
+        maxH = std::max(maxH, sc.height[size_t(i)]);
     }
     stats.minHeight = minH;
     stats.maxHeight = maxH;
@@ -360,21 +394,39 @@ ChunkGenStats DensityGenerator::generate(const ChunkKey& key, DensityField& out)
     return stats;
 }
 
+SlopeXZ DensityGenerator::baseGradient(float x, float z) const {
+    const float kGradEps = m_params.stripe.gradEps;   // must match the grid path, or
+    const int seed = m_params.seed;                   // edits and meshes would disagree
+    const auto h = [&](float px, float pz) {
+        return shapeColumn(m_params, m_impl->continental.single2D(px, pz, seed),
+                           m_impl->mountainMask.single2D(px, pz, seed), m_impl->ridge.single2D(px, pz, seed),
+                           m_impl->hills.single2D(px, pz, seed), 0.f).height;
+    };
+    const float h0 = h(x, z);
+    return {(h(x + kGradEps, z) - h0) * (1.f / kGradEps), (h(x, z + kGradEps) - h0) * (1.f / kGradEps)};
+}
+
 float DensityGenerator::sampleHeight(float x, float z) const {
     const int seed = m_params.seed;
     const ColumnShape c = shapeColumn(m_params, m_impl->continental.single2D(x, z, seed),
                                       m_impl->mountainMask.single2D(x, z, seed), m_impl->ridge.single2D(x, z, seed),
                                       m_impl->hills.single2D(x, z, seed), m_impl->entrance.single2D(x, z, seed));
-    return c.height;
+    if (!m_params.stripeErosion) return c.height;
+    SlopeXZ g = baseGradient(x, z);
+    return c.height + stripeErosion(m_params.stripe, x, z, g);
 }
 
 float DensityGenerator::sampleDensity(const Vec3i& v) const {
     const TerrainParams& p = m_params;
     const int seed = p.seed;
     const float x = float(v.x) * world::kVoxelSize, y = float(v.y) * world::kVoxelSize, z = float(v.z) * world::kVoxelSize;
-    const ColumnShape c = shapeColumn(p, m_impl->continental.single2D(x, z, seed), m_impl->mountainMask.single2D(x, z, seed),
-                                      m_impl->ridge.single2D(x, z, seed), m_impl->hills.single2D(x, z, seed),
-                                      m_impl->entrance.single2D(x, z, seed));
+    ColumnShape c = shapeColumn(p, m_impl->continental.single2D(x, z, seed), m_impl->mountainMask.single2D(x, z, seed),
+                                m_impl->ridge.single2D(x, z, seed), m_impl->hills.single2D(x, z, seed),
+                                m_impl->entrance.single2D(x, z, seed));
+    if (p.stripeErosion) {
+        SlopeXZ g = baseGradient(x, z);
+        c.height += stripeErosion(p.stripe, x, z, g);
+    }
     const float slack = verticalSlack();
     if (y > c.height + slack) return kDensityClamp;
     const float oh = std::abs(y - c.height) < slack ? m_impl->overhang.single3D(x, y, z, seed) : 0.f;
@@ -407,7 +459,10 @@ HeightRange DensityGenerator::columnRange(float x0, float z0, float x1, float z1
         lo = std::min(lo, h);
         hi = std::max(hi, h);
     }
-    const float margin = 24.f + 0.25f * (hi - lo) + verticalSlack();
+    // The probes above are unfiltered, so the envelope has to allow for however
+    // far the erosion could move a column either way.
+    const float stripeSlack = m_params.stripeErosion ? stripeMaxOffset(m_params.stripe) : 0.f;
+    const float margin = 24.f + 0.25f * (hi - lo) + verticalSlack() + stripeSlack;
     return {lo - margin, hi + margin};
 }
 

@@ -1094,6 +1094,8 @@ int main(int argc, char** argv) {
     // kept so the two can still be compared.
     bool sortChunks = true;
     bool pipeStats = false;         // count pixel shader invocations: overdraw
+    bool stripes = false;           // gradient-aligned stripe erosion on the heights
+    float stripeAmp = 5.f, stripeWidth = 60.f;
     int traceLod = 3;               // first LOD handed over as density instead of geometry
     bool fixedCam = false;
     double camArgs[5] = {};         // x y z yaw pitch (degrees)
@@ -1115,6 +1117,9 @@ int main(int argc, char** argv) {
         else if (a == "--no-skirts") skirtCells = 0.f;
         else if (a == "--far-trace") farTrace = true;
         else if (a == "--no-sort") sortChunks = false;
+        else if (a == "--stripes") stripes = true;
+        else if (a == "--stripe-amp") stripeAmp = float(next(stripeAmp));
+        else if (a == "--stripe-width") stripeWidth = float(next(stripeWidth));
         else if (a == "--stats") pipeStats = true;
         else if (a == "--trace-lod") traceLod = int(next(traceLod));
         else if (a == "--skirt") skirtCells = float(next(4.5));
@@ -1328,6 +1333,20 @@ int main(int argc, char** argv) {
     TaskSystem tasks;
     TerrainParams terrainParams;
     terrainParams.seed = seed;
+    if (stripes) {
+        terrainParams.stripeErosion = true;
+        terrainParams.stripe.seed = seed;
+        terrainParams.stripe.amplitude = stripeAmp;
+        terrainParams.stripe.stripeWidth = stripeWidth;
+        terrainParams.stripe.cellSize = stripeWidth * 4.f;
+        // The stripes are meant to do the mid-scale work, not join in. Left at
+        // full strength the hills FBm puts its own bumps across the gullies and
+        // the result reads as lumps rather than drainage.
+        terrainParams.hillHeight *= 0.25f;
+        std::printf("stripes    : %d octaves, %.0f m amplitude, %.0f m between gullies, up to %.0f m of relief\n",
+                    terrainParams.stripe.octaves, double(stripeAmp), double(stripeWidth),
+                    double(stripeMaxOffset(terrainParams.stripe)));
+    }
     DensityGenerator generator(terrainParams);
     DeltaStore deltas;
 

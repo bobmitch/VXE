@@ -157,7 +157,12 @@ public:
     float sampleDensity(const Vec3i& voxel) const;
 
     // Surface height (no caves/overhangs) - used for spawn placement and AI.
-    float sampleHeight(float x, float z) const;
+    // `step` is the sample spacing to evaluate at: 1 for the true surface,
+    // 2^lod for the surface a chunk at that level actually builds. Octaves
+    // finer than the spacing can carry are faded out rather than point-sampled
+    // (which is aliasing, and is what made a distant hill jump when its chunk
+    // changed level). Passing 1 is guaranteed to be what it always was.
+    float sampleHeight(float x, float z, float step = 1.f) const;
 
     // Conservative height bounds over an XZ rectangle (for streaming culling).
     HeightRange columnRange(float x0, float z0, float x1, float z1) const;

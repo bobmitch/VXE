@@ -111,7 +111,11 @@ inline void cellPivot(int32_t cx, int32_t cz, int32_t seed, float& u, float& v) 
 // gradient. `grad` must come in as the gradient of the base height function,
 // measured at a fixed world-space epsilon -- not at the chunk's sample spacing,
 // or the gully pattern would change shape at every LOD and pop when it did.
-inline float stripeErosion(const StripeParams& sp, float x, float z, SlopeXZ& grad) {
+// `step` is the chunk's sample spacing. A stripe narrower than two samples
+// across is not a gully at that LOD, it is noise riding on the height, and it
+// lands wherever the lattice happens to cut it -- so the finer octaves fade
+// out as the samples spread. LOD0 passes 1 and keeps all of them exactly.
+inline float stripeErosion(const StripeParams& sp, float x, float z, SlopeXZ& grad, float step = 1.f) {
     using namespace stripe_detail;
     constexpr float kTwoPi = 6.283185307179586f;
 
@@ -127,7 +131,8 @@ inline float stripeErosion(const StripeParams& sp, float x, float z, SlopeXZ& gr
         // Flat ground has no flow direction, so stripes there would fold into
         // chaos around peaks and valleys. Fade them out instead.
         const float steep = smoothstep(0.15f * sp.slopeRef, sp.slopeRef, len);
-        const float fade = steep * lerp(1.f - sp.detailBias, 1.f, creaseMask);
+        const float band = step <= 1.f ? 1.f : smoothstep(2.f * step, 4.f * step, width);
+        const float fade = steep * lerp(1.f - sp.detailBias, 1.f, creaseMask) * band;
         if (fade > 0.001f) {
             // Downhill, and the across-flow axis the stripes vary along.
             const float inv = 1.f / len;

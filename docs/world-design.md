@@ -1019,6 +1019,43 @@ And it is expensive in exactly the way failure 5 predicts: the demo's initial st
 sub-pixel at the kilometre such a chunk implies. The frame cost is nil — 59.8 fps either way, with
 the price landing on upload bandwidth and generation time instead.
 
+**[done, and it bought less than expected]** Mechanism 3 is fixed and the fix is worth keeping, but it
+is not what makes the ground move. Every fractal is now evaluated with as many octaves as the chunk's
+sample spacing can carry and no more: octave *o* has wavelength `scale / 2^o`, needs two samples
+across it to mean anything, and past that the lattice does not average it away but lands on arbitrary
+points of it. The count is fractional, so the last octave fades in rather than appearing. Stripe
+erosion is band-limited the same way, on stripe width. LOD0 is exempt by construction and is
+bit-identical — 8,100 of 8,100 probe columns — because §8 requires it.
+
+Then the measurement, which did not say what it was supposed to. Taking the surface a level-*L* chunk
+reconstructs across its own lattice and differencing it against level *L−1*'s, over 8,100 points:
+
+| level | stride | point-sampled (before) | prefiltered (after) |
+|---|---|---|---|
+| 1 | 2 m | rms 0.37, max 5.24 | rms 0.37, max 5.23 |
+| 2 | 4 m | rms 0.68, max 13.17 | rms 0.68, max 13.17 |
+| 3 | 8 m | rms 1.44, max 24.86 | rms 1.44, max 24.70 |
+| 4 | 16 m | rms 3.20, max 54.95 | rms 3.17, max 53.14 |
+| 5 | 32 m | rms 7.54, max 108.11 | rms 7.55, max 112.15 |
+
+The filter is working — it moves a column by up to 18 m at a 32 m stride and by exactly nothing at
+LOD0 — and it still changes the transition by about 1%. The reason is a clean split, and it is the
+useful thing here:
+
+**The levels where aliasing bites are the levels you cannot see it at, and the levels where the pop
+is visible are not aliasing at all.** Nothing fades below a 8 m stride, because at 2 m and 4 m every
+octave the terrain has is adequately sampled — correctly, and that is LOD1 and LOD2, the levels close
+enough to watch. What remains there is *interpolation* error: a lattice linearly spanning terrain
+that genuinely curves between its samples. That is inherent to sampling a smooth field at a coarse
+rate, it does not diminish with a better filter, and it is roughly all of the 0.37 m and 0.68 m
+above.
+
+So mechanism 3 was real, is now correct, and was never the symptom. The symptom is geometric, which
+means the answer is geometric: **morph the vertices**, each chunk interpolating its positions toward
+where the next level would put them across the transition band, so the change is spread over metres
+of approach instead of landing on one frame. The screen-space crossfade raised in §1's early notes
+is the cheaper cousin and hides the same thing less well. Neither is built.
+
 ### This is not an argument for a different architecture
 
 The obvious reading of the above is that the chunked-LOD scheme is at fault and that something

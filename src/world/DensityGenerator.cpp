@@ -43,45 +43,109 @@ float evalSpline(float c) {
 // Noise backend. FastNoise2 is the production path; the software fallback
 // exists so the engine library builds with VXE_WITH_FASTNOISE2=OFF (CI, ports).
 // ---------------------------------------------------------------------------
+// How many octaves a given sample spacing can actually carry.
+//
+// Octave o (0-based) of a lacunarity-2 fractal has wavelength scale / 2^o, and
+// needs two samples across it to mean anything. Past that the samples do not
+// average the octave away, they land on arbitrary points of it -- which is why
+// a coarse chunk is not a smoothed version of the terrain but a different
+// terrain, and why the surface jumps rather than softens when the LOD changes.
+//
+// Returns a fractional count so the last octave fades in rather than appearing.
+inline float octavesForStep(float scale, int octaves, float step) {
+    // LOD0 is exact by construction, whatever the arithmetic says. Edits are
+    // stored relative to regenerated base density (§8), so the finest level
+    // has to stay bit-identical to what it has always produced.
+    if (step <= 1.f) return float(octaves);
+    const float k = std::log2(std::max(scale, 1e-3f) / (2.f * step)) + 1.f;
+    return std::clamp(k, 1.f, float(octaves));
+}
+
 #if VXE_WITH_FASTNOISE2
 class NoiseNode {
 public:
     NoiseNode() = default;
-    explicit NoiseNode(FastNoise::SmartNode<> n, int seedOffset) : m_node(std::move(n)), m_seedOffset(seedOffset) {}
+    // `bank[i]` is the same fractal truncated to i+1 octaves. FastNoise2 fixes
+    // the octave count at construction, so a fractional fade has to come from
+    // blending two of them; they share a seed and a scale, so the coarse
+    // octaves are identical between the two and only the finest differs.
+    NoiseNode(std::vector<FastNoise::SmartNode<>> bank, float scale, int seedOffset)
+        : m_bank(std::move(bank)), m_scale(scale), m_seedOffset(seedOffset) {}
 
     void grid2D(float* out, float x0, float z0, int count, float step, int seed) const {
-        m_node->GenUniformGrid2D(out, x0, z0, count, count, step, step, seed + m_seedOffset);
+        const Blend b = blendFor(step);
+        m_bank[b.lo]->GenUniformGrid2D(out, x0, z0, count, count, step, step, seed + m_seedOffset);
+        if (b.t <= 0.002f) return;
+        // 2D fields are 38^2 per chunk and carry the large amplitudes, so the
+        // second evaluation is worth it here.
+        static thread_local std::vector<float> tmp;
+        const size_t n = size_t(count) * size_t(count);
+        tmp.resize(n);
+        m_bank[b.lo + 1]->GenUniformGrid2D(tmp.data(), x0, z0, count, count, step, step, seed + m_seedOffset);
+        for (size_t i = 0; i < n; ++i) out[i] += (tmp[i] - out[i]) * b.t;
     }
     void grid3D(float* out, float x0, float y0, float z0, int count, float step, int seed) const {
-        m_node->GenUniformGrid3D(out, x0, y0, z0, count, count, count, step, step, step, seed + m_seedOffset);
+        // 3D is 38^3 and the amplitudes riding on it are small, so the partial
+        // octave is dropped rather than blended. Truncating is still filtered;
+        // it just arrives a fraction of a level earlier than it needs to.
+        const Blend b = blendFor(step);
+        m_bank[b.lo]->GenUniformGrid3D(out, x0, y0, z0, count, count, count, step, step, step, seed + m_seedOffset);
     }
-    float single2D(float x, float z, int seed) const { return m_node->GenSingle2D(x, z, seed + m_seedOffset); }
-    float single3D(float x, float y, float z, int seed) const { return m_node->GenSingle3D(x, y, z, seed + m_seedOffset); }
+    float single2D(float x, float z, int seed, float step = 1.f) const {
+        const Blend b = blendFor(step);
+        const float lo = m_bank[b.lo]->GenSingle2D(x, z, seed + m_seedOffset);
+        if (b.t <= 0.002f) return lo;
+        return lo + (m_bank[b.lo + 1]->GenSingle2D(x, z, seed + m_seedOffset) - lo) * b.t;
+    }
+    float single3D(float x, float y, float z, int seed, float step = 1.f) const {
+        return m_bank[blendFor(step).lo]->GenSingle3D(x, y, z, seed + m_seedOffset);
+    }
 
 private:
-    FastNoise::SmartNode<> m_node;
+    struct Blend { int lo; float t; };
+    Blend blendFor(float step) const {
+        const float k = octavesForStep(m_scale, int(m_bank.size()), step);
+        int lo = int(k) - 1;                       // bank index of floor(k) octaves
+        float t = k - float(lo + 1);
+        if (lo + 1 >= int(m_bank.size())) { lo = int(m_bank.size()) - 1; t = 0.f; }
+        return {lo, t};
+    }
+
+    std::vector<FastNoise::SmartNode<>> m_bank;
+    float m_scale = 1.f;
     int m_seedOffset = 0;
 };
 
-FastNoise::SmartNode<> makeFbm(float scale, int octaves, float gain = 0.5f, float lacunarity = 2.0f) {
-    auto simplex = FastNoise::New<FastNoise::Simplex>();
-    simplex->SetScale(scale);
-    auto fbm = FastNoise::New<FastNoise::FractalFBm>();
-    fbm->SetSource(simplex);
-    fbm->SetOctaveCount(octaves);
-    fbm->SetGain(gain);
-    fbm->SetLacunarity(lacunarity);
-    return fbm;
+// Banks, not single nodes: one generator per octave count from 1 to `octaves`,
+// so a chunk can ask for as much of the fractal as its sample spacing carries.
+std::vector<FastNoise::SmartNode<>> makeFbm(float scale, int octaves, float gain = 0.5f,
+                                            float lacunarity = 2.0f) {
+    std::vector<FastNoise::SmartNode<>> bank;
+    for (int o = 1; o <= octaves; ++o) {
+        auto simplex = FastNoise::New<FastNoise::Simplex>();
+        simplex->SetScale(scale);
+        auto fbm = FastNoise::New<FastNoise::FractalFBm>();
+        fbm->SetSource(simplex);
+        fbm->SetOctaveCount(o);
+        fbm->SetGain(gain);
+        fbm->SetLacunarity(lacunarity);
+        bank.push_back(fbm);
+    }
+    return bank;
 }
-FastNoise::SmartNode<> makeRidged(float scale, int octaves) {
-    auto simplex = FastNoise::New<FastNoise::Simplex>();
-    simplex->SetScale(scale);
-    auto ridged = FastNoise::New<FastNoise::FractalRidged>();
-    ridged->SetSource(simplex);
-    ridged->SetOctaveCount(octaves);
-    ridged->SetGain(0.5f);
-    ridged->SetWeightedStrength(0.6f); // smoother valleys, sharp crests
-    return ridged;
+std::vector<FastNoise::SmartNode<>> makeRidged(float scale, int octaves) {
+    std::vector<FastNoise::SmartNode<>> bank;
+    for (int o = 1; o <= octaves; ++o) {
+        auto simplex = FastNoise::New<FastNoise::Simplex>();
+        simplex->SetScale(scale);
+        auto ridged = FastNoise::New<FastNoise::FractalRidged>();
+        ridged->SetSource(simplex);
+        ridged->SetOctaveCount(o);
+        ridged->SetGain(0.5f);
+        ridged->SetWeightedStrength(0.6f); // smoother valleys, sharp crests
+        bank.push_back(ridged);
+    }
+    return bank;
 }
 FastNoise::SmartNode<> makeSimplex(float scale) {
     auto simplex = FastNoise::New<FastNoise::Simplex>();
@@ -122,35 +186,41 @@ enum class Kind { Simplex, FBm, Ridged };
 class NoiseNode {
 public:
     NoiseNode() = default;
-    NoiseNode(Kind k, float scale, int octaves, int seedOffset) : m_kind(k), m_freq(1.f / scale), m_oct(octaves), m_seedOffset(seedOffset) {}
-    float eval(float x, float y, float z, int seed) const {
+    NoiseNode(Kind k, float scale, int octaves, int seedOffset) : m_kind(k), m_scale(scale), m_freq(1.f / scale), m_oct(octaves), m_seedOffset(seedOffset) {}
+    // No bank needed here: the octave loop is right there, so the fade can be
+    // applied to the amplitude exactly rather than by blending two fractals.
+    float eval(float x, float y, float z, int seed, float step = 1.f) const {
         seed += m_seedOffset;
         x *= m_freq; y *= m_freq; z *= m_freq;
         if (m_kind == Kind::Simplex) return gradientNoise(x, y, z, seed);
+        const float keep = octavesForStep(m_scale, m_oct, step);
         float sum = 0.f, amp = 1.f, norm = 0.f;
         for (int o = 0; o < m_oct; ++o) {
+            const float w = std::clamp(keep - float(o), 0.f, 1.f);
+            if (w <= 0.f) break;
             float n = gradientNoise(x, y, z, seed + o);
             if (m_kind == Kind::Ridged) n = 1.f - 2.f * std::abs(n);
-            sum += n * amp; norm += amp; amp *= 0.5f;
+            sum += n * amp * w; norm += amp * w; amp *= 0.5f;
             x *= 2.f; y *= 2.f; z *= 2.f;
         }
-        return sum / norm;
+        return norm > 0.f ? sum / norm : 0.f;
     }
     void grid2D(float* out, float x0, float z0, int count, float step, int seed) const {
         for (int j = 0; j < count; ++j)
-            for (int i = 0; i < count; ++i) out[i + j * count] = eval(x0 + float(i) * step, 0.f, z0 + float(j) * step, seed);
+            for (int i = 0; i < count; ++i) out[i + j * count] = eval(x0 + float(i) * step, 0.f, z0 + float(j) * step, seed, step);
     }
     void grid3D(float* out, float x0, float y0, float z0, int count, float step, int seed) const {
         for (int k = 0; k < count; ++k)
             for (int j = 0; j < count; ++j)
                 for (int i = 0; i < count; ++i)
-                    out[i + count * (j + count * k)] = eval(x0 + float(i) * step, y0 + float(j) * step, z0 + float(k) * step, seed);
+                    out[i + count * (j + count * k)] = eval(x0 + float(i) * step, y0 + float(j) * step, z0 + float(k) * step, seed, step);
     }
-    float single2D(float x, float z, int seed) const { return eval(x, 0.f, z, seed); }
-    float single3D(float x, float y, float z, int seed) const { return eval(x, y, z, seed); }
+    float single2D(float x, float z, int seed, float step = 1.f) const { return eval(x, 0.f, z, seed, step); }
+    float single3D(float x, float y, float z, int seed, float step = 1.f) const { return eval(x, y, z, seed, step); }
 
 private:
     Kind m_kind = Kind::Simplex;
+    float m_scale = 1.f;
     float m_freq = 1.f;
     int m_oct = 1;
     int m_seedOffset = 0;
@@ -182,12 +252,12 @@ struct DensityGenerator::Impl {
 
     explicit Impl(const TerrainParams& p) {
 #if VXE_WITH_FASTNOISE2
-        continental  = NoiseNode(makeFbm(p.continentalScale, 5), 0);
-        mountainMask = NoiseNode(makeFbm(p.mountainMaskScale, 3), 101);
-        ridge        = NoiseNode(makeRidged(p.ridgeScale, 6), 202);
-        hills        = NoiseNode(makeFbm(p.hillScale, 4), 303);
-        entrance     = NoiseNode(makeFbm(400.f, 2), 404);
-        overhang     = NoiseNode(makeFbm(p.overhangScale, 3), 505);
+        continental  = NoiseNode(makeFbm(p.continentalScale, 5), p.continentalScale, 0);
+        mountainMask = NoiseNode(makeFbm(p.mountainMaskScale, 3), p.mountainMaskScale, 101);
+        ridge        = NoiseNode(makeRidged(p.ridgeScale, 6), p.ridgeScale, 202);
+        hills        = NoiseNode(makeFbm(p.hillScale, 4), p.hillScale, 303);
+        entrance     = NoiseNode(makeFbm(400.f, 2), 400.f, 404);
+        overhang     = NoiseNode(makeFbm(p.overhangScale, 3), p.overhangScale, 505);
 #else
         continental  = NoiseNode(Kind::FBm, p.continentalScale, 5, 0);
         mountainMask = NoiseNode(Kind::FBm, p.mountainMaskScale, 3, 101);
@@ -358,7 +428,7 @@ ChunkGenStats DensityGenerator::generate(const ChunkKey& key, DensityField& out)
                 const size_t i = size_t(xi + S * zi);
                 const float h = sc.height[i];
                 SlopeXZ g{(sc.heightDx[i] - h) * (1.f / kGradEps), (sc.heightDz[i] - h) * (1.f / kGradEps)};
-                sc.height[i] = h + stripeErosion(p.stripe, x0 + float(xi) * step, z0 + float(zi) * step, g);
+                sc.height[i] = h + stripeErosion(p.stripe, x0 + float(xi) * step, z0 + float(zi) * step, g, step);
             }
     }
 
@@ -492,14 +562,16 @@ void DensityGenerator::caveEntrancesNear(const Vec3d& centre, float radius, std:
             }
 }
 
-float DensityGenerator::sampleHeight(float x, float z) const {
+float DensityGenerator::sampleHeight(float x, float z, float step) const {
     const int seed = m_params.seed;
-    const ColumnShape c = shapeColumn(m_params, m_impl->continental.single2D(x, z, seed),
-                                      m_impl->mountainMask.single2D(x, z, seed), m_impl->ridge.single2D(x, z, seed),
-                                      m_impl->hills.single2D(x, z, seed), m_impl->entrance.single2D(x, z, seed));
+    const ColumnShape c = shapeColumn(m_params, m_impl->continental.single2D(x, z, seed, step),
+                                      m_impl->mountainMask.single2D(x, z, seed, step),
+                                      m_impl->ridge.single2D(x, z, seed, step),
+                                      m_impl->hills.single2D(x, z, seed, step),
+                                      m_impl->entrance.single2D(x, z, seed, step));
     if (!m_params.stripeErosion) return c.height;
     SlopeXZ g = baseGradient(x, z);
-    return c.height + stripeErosion(m_params.stripe, x, z, g);
+    return c.height + stripeErosion(m_params.stripe, x, z, g, step);
 }
 
 float DensityGenerator::sampleDensity(const Vec3i& v) const {

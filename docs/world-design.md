@@ -1171,6 +1171,51 @@ pop at whichever LOD that happens. Weighting air samples higher defers it by abo
 thin walls in exchange. What is left open is whether the right bias differs for added terrain versus
 removed, and what either does at a chunk boundary, where the skirts already cover LOD seams.
 
+### Scale, and where a cave ends
+
+**[done]** Two things came out of walking the placed network that the design above did not anticipate,
+and one of them is not about caves at all.
+
+**The world was built at life size, and life size is the wrong unit.** A 1:1 landscape photographs
+well and plays as a commute. The mystery in Valheim or Minecraft comes from not being able to *see*
+what is over there, not from it being a kilometre away — and a landmark that looks too far to walk to
+is a landmark nobody walks to. `TerrainParams::worldScale` divides every horizontal wavelength *and*
+every height by one number, which is a uniform shrink: identical shapes, identical slopes, an
+identical view, and the walk shorter by that factor. It is set to 3.
+
+Cave bore is deliberately exempt. Passages were already at the limit of what 1 m samples can carve
+detail into — a 3 m passage is six voxels across, and no amount of noise makes six voxels look like
+rock, which is why they read as machined however much the walls were displaced. The network's
+footprint shrinks with the land while the tunnels keep their size, so they end up three times roomier
+against the landscape than they were. That is the same oversizing the reference games do, and it
+reads as natural because nothing in view offers a human reference. The same argument sets the wall
+noise: feature size follows the *local* radius, so a crawl and a hall get the same number of features
+across their bore, which is what self-similar means and what a fixed feature size could never give.
+
+**A passage has to run out.** The first network held its bore 200 m down and read as a corridor. Now
+a squeeze falls with every metre descended, and the walk ends when it bottoms out — on a final
+segment closing to nothing, because a capsule ending at full bore leaves a flat disc of rock across
+the passage, which reads as a wall somebody built. Chambers reopen what lies beyond them, but never
+to what it was: each starts a run at a seeded fraction of the one before, so a system steps down
+through its chambers and ends somewhere it cannot continue from. A full reset let a system ladder its
+way to any depth at full bore, which is how the 1464 m systems happened. They now span 280–540 m.
+
+**Dolines are emergent, and should stay that way.** Nothing places sinkholes. A chamber whose lobes
+happen to intersect the surface opens as a bowl in the ground, and in play those read as the most
+inviting entrances of the lot — far more than the tunnel mouths placement works hard to flare. The
+feature exists only because chambers are not clamped below the surface. Anything that later clamps
+them would delete it silently, and the roster in §5 would lose its best entrance before anyone
+noticed it had one.
+
+Measured: a chunk mid-system costs **4.0 ms** against **0.97 ms** for ground with no cave within a
+region cell, at LOD0 over 5×5×5 blocks. The wall field runs only in a shell around the passage; the
+gap is the price of all of it. 13% of region cells hold a system.
+
+**[open]** Do passages now end too early? The squeeze was tuned against systems that were far too
+long, and the first read from play is "maybe, hard to tell". It is one constant, and the honest
+answer needs the biome work in §5 behind it — the Hollows should presumably run further than anywhere
+else, which makes this a per-topology number rather than a global one.
+
 ---
 
 ## 10. Open questions, ranked

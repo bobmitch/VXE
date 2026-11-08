@@ -144,9 +144,14 @@ void walk(const CaveParams& p, det::Stream& rs, const Vec3f& from, float bearing
         // Taper away over the last third, so a passage ends rather than stops.
         const float t = float(i) / float(std::max(1, steps));
         const float taper = t < 0.66f ? 1.f : 1.f - 0.72f * ((t - 0.66f) / 0.34f);
-        return std::max(1.1f, base * breathe * taper);
+        return std::max(1.6f, base * breathe * taper);
     };
     float radius = radiusAt(0);
+    // How far the passage has closed down. Falls with descent and ends the
+    // walk when it bottoms out. `runStart` is what the current run began at;
+    // every chamber starts a new run strictly smaller than the last, so the
+    // system steps down rather than being handed its bore back.
+    float squeeze = 1.f, runStart = 1.f;
 
     for (int32_t i = 0; i < steps; ++i) {
         // Wander. Scaled by depth so the first few steps stay near the bearing
@@ -175,7 +180,16 @@ void walk(const CaveParams& p, det::Stream& rs, const Vec3f& from, float bearing
         if (next.x < allowed.min.x || next.x > allowed.max.x || next.z < allowed.min.z || next.z > allowed.max.z)
             return;
 
-        const float nextRadius = radiusAt(i + 1);
+        // Mostly depth, with a small term from distance along: a passage that
+        // has flattened out against maxDepth still has somewhere to go.
+        squeeze -= (drop + step * 0.08f) * p.depthSqueeze;
+
+        // Floored, because a passage is either somewhere you can go or it is
+        // the end. A small system squeezed to 0.5 m bore is neither: too
+        // narrow to walk, too narrow to see, and barely wider than the samples
+        // meant to carve it. Big systems still narrow visibly -- they start
+        // far enough above the floor to have room to.
+        const float nextRadius = std::max(2.f, radiusAt(i + 1) * std::max(squeeze, p.squeezeFloor));
         CaveSegment seg{cur, next, radius, nextRadius};
         sys.segments.push_back(seg);
         growBounds(sys.bounds, cur, radius);
@@ -183,6 +197,16 @@ void walk(const CaveParams& p, det::Stream& rs, const Vec3f& from, float bearing
 
         cur = next;
         radius = nextRadius;
+
+        if (squeeze <= p.squeezeFloor) {
+            // Pinch out rather than stop. A capsule ending at its full bore
+            // leaves a flat disc of rock across the passage, which reads as a
+            // wall someone built; closing to nothing reads as a cave ending.
+            const Vec3f end = next + Vec3f{det::cos(yaw), -0.35f, det::sin(yaw)} * (step * 0.6f);
+            sys.segments.push_back({next, end, nextRadius, 0.35f});
+            growBounds(sys.bounds, end, 0.35f);
+            return;
+        }
 
         // Chambers where a passage turns a corner or splits: the places a
         // player would naturally stop, which is where a destination belongs.
@@ -203,12 +227,17 @@ void walk(const CaveParams& p, det::Stream& rs, const Vec3f& from, float bearing
                     sys.chambers.push_back(ch);
                     growBounds(sys.bounds, ch.centre, std::max(ch.radii.x, std::max(ch.radii.y, ch.radii.z)));
                 }
+                runStart *= rs.range(p.chamberReliefMin, p.chamberReliefMax);
+                squeeze = runStart;
             }
         }
         if (branching) {
             const float turn = rs.range(0.6f, 1.5f) * (rs.chance(0.5f) ? 1.f : -1.f);
+            // A branch off a passage that has already closed down starts from
+            // where its parent is, not from full bore. Otherwise the tightest
+            // part of a system is where its widest passages come from.
             walk(p, rs, cur, yaw + turn, descent * rs.range(0.5f, 1.2f), std::max(4, steps / 2), branchDepth + 1,
-                 entranceY, scale, allowed, sys);
+                 entranceY, scale * std::max(squeeze, p.squeezeFloor), allowed, sys);
         }
     }
 }
@@ -267,6 +296,26 @@ CaveSystem buildCaveSystem(const CaveParams& p, int32_t seed, int32_t cellX, int
     return sys;
 }
 
+// How far the rock field pushes a wall in or out. In one place, because the
+// splat and the query have to agree to the last bit: a chunk meshes with one
+// and an edit is stored relative to the other.
+//
+// Two things make this read as rock rather than as a wobbled tube. Feature
+// size follows the local radius, so a crawl and a hall get the same number of
+// features across their bore -- a fixed feature size meant narrow passages
+// were modulated by wavelengths longer than they were wide, which is a bend,
+// not a texture. And the field is sampled squashed in Y, so its features come
+// out wide and flat: bedding, ledges, shelves.
+float wallOffset(const CaveParams& cp, const Vec3f& p, float localRadius, float minWave) {
+    const float rough = localRadius * cp.wallRoughness;
+    if (rough <= 0.01f) return 0.f;
+    const Vec3f bedded{p.x, p.y * cp.wallBedding, p.z};
+    // Squashing Y shortens the vertical wavelength by the same factor, so the
+    // band limit has to rise with it or the shelves alias at coarse LOD.
+    return rockField(bedded, localRadius * cp.wallScaleFactor, cp.wallOctaves, minWave * cp.wallBedding,
+                     0x51F) * rough;
+}
+
 void splatCaves(const CaveParams& cp, const CaveSystem& sys, const Vec3f& origin, float step, int32_t n,
                 float grow, float clampDist, float* out) {
     const float invStep = 1.f / step;
@@ -292,7 +341,7 @@ void splatCaves(const CaveParams& cp, const CaveSystem& sys, const Vec3f& origin
                     // and open air are decided already, and the noise is the
                     // expensive part of this loop.
                     if (rough > 0.01f && d > -rough - step && d < rough + step)
-                        d += rockField(p, cp.wallScale, cp.wallOctaves, minWave, 0x51F) * rough;
+                        d += wallOffset(cp, p, localRadius, minWave);
                     float& dst = out[row + size_t(x)];
                     if (d < dst) dst = d;
                 }
@@ -329,7 +378,7 @@ float caveDistance(const CaveParams& cp, const CaveSystem& sys, const Vec3f& p, 
     d -= grow;
     const float rough = radius * cp.wallRoughness;
     if (rough > 0.01f && d > -rough - sampleStep && d < rough + sampleStep)
-        d += rockField(p, cp.wallScale, cp.wallOctaves, sampleStep * 2.2f, 0x51F) * rough;
+        d += wallOffset(cp, p, radius, sampleStep * 2.2f);
     return d;
 }
 

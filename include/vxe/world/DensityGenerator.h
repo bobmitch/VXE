@@ -108,7 +108,31 @@ struct TerrainParams {
     // generator version change in the sense §8 of docs/world-design.md means.
     bool stripeErosion = false;
     StripeParams stripe{};
+
+    // Every length above is in metres, and life-size metres are the wrong
+    // unit for a landscape you have to cross on foot. A world built at 1:1
+    // photographs well and plays as a commute: the mystery in Valheim or
+    // Minecraft comes from not being able to *see* what is over there, not
+    // from it being a kilometre away, and a landmark that looks too far to
+    // walk to is a landmark nobody walks to.
+    //
+    // Dividing every horizontal wavelength *and* every height by the same
+    // number is a uniform shrink: identical shapes, identical slopes, an
+    // identical view -- and the walk is shorter by that factor.
+    //
+    // Cave bore is deliberately exempt. Passages are already near the limit of
+    // what 1 m samples can carve detail into (CaveParams::tunnelRadius), so
+    // the network's footprint shrinks with the world while the tunnels keep
+    // their size -- which makes them relatively roomier, the direction that
+    // was wanted anyway.
+    float worldScale = 3.f;
 };
+
+// Applies worldScale to every length in `p` and resets it to 1. The generator
+// does this to its own copy on construction, so anything that needs the
+// numbers the generator is actually using should read them back from
+// DensityGenerator::params() rather than scaling a second time.
+void applyWorldScale(TerrainParams& p);
 
 struct ChunkGenStats {
     bool uniform = false;          // all air or all solid: mesher can skip

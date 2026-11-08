@@ -59,8 +59,13 @@ struct CaveParams {
     // all, which is the whole correction over the noise fields.
     float regionDensity = 0.3f;
 
-    float tunnelRadius = 3.2f;       // metres, mean; individual passages vary
-    float tunnelRadiusVar = 1.1f;
+    // Passages are deliberately wider than a person needs. At 1 m samples a
+    // 3 m passage is six voxels across, and no amount of noise makes six
+    // voxels look like rock -- the detail that would sell it is finer than the
+    // thing it is carved into. Games oversize their caves for exactly this
+    // reason, and it reads as natural rather than generous.
+    float tunnelRadius = 5.0f;       // metres, mean; individual passages vary
+    float tunnelRadiusVar = 1.7f;
     float stepLength = 26.f;         // metres between route vertices
     int32_t trunkSteps = 22;         // how far a trunk runs before it stops
     int32_t maxBranchDepth = 2;      // branches off branches, and no further
@@ -69,9 +74,25 @@ struct CaveParams {
     float descentRate = 0.34f;       // metres down per metre along
     float maxDepth = 190.f;          // below the entrance
 
+    // A passage closes down as it descends. The water that cut it had less and
+    // less to work with the further it went, and a cave that held the same
+    // bore 200 m down reads as a corridor someone built. Depth drives it, with
+    // a little from sheer distance so a passage that flattens out at depth
+    // still ends rather than running on.
+    float depthSqueeze = 0.0085f;    // fraction of bore lost per metre descended
+    float squeezeFloor = 0.22f;      // tightest it goes before the passage ends
+    // A chamber reopens what lies beyond it -- a junction is fed from
+    // somewhere else, so the squeeze starts again rather than carrying on from
+    // a crawl. But never back to what it was: each chamber starts a run that
+    // is a seeded fraction of the one before, so a system steps down through
+    // its chambers and ends up somewhere it cannot go on from. A full reset
+    // would let a system ladder its way to any depth at full bore.
+    float chamberReliefMin = 0.5f;
+    float chamberReliefMax = 0.82f;
+
     float chamberChance = 0.3f;      // per branch point
-    float chamberRadius = 13.f;
-    float chamberRadiusVar = 7.f;
+    float chamberRadius = 18.f;
+    float chamberRadiusVar = 9.f;
     // A chamber is a cluster of overlapping lobes rather than one ellipsoid.
     // Unioned by min() they read as a room with alcoves instead of a bowl.
     int32_t chamberLobes = 4;
@@ -84,7 +105,7 @@ struct CaveParams {
     // A mouth is wider than the passage behind it, and stays wide for a little
     // way in. Without this an entrance is a 3 m hole in a hillside, which in
     // practice could not be found even with a marker standing over it.
-    float entranceFlare = 3.4f;      // mouth radius as a multiple of the passage
+    float entranceFlare = 2.8f;      // mouth radius as a multiple of the passage
     float throatLength = 18.f;       // metres of flared opening before it narrows
 
     // How much the passage radius breathes along its length. Constrictions and
@@ -96,9 +117,18 @@ struct CaveParams {
     // irregular. Displacement is a fraction of the *local* radius, so a wide
     // chamber gets metres of relief and a narrow passage gets centimetres and
     // does not pinch itself shut.
-    float wallRoughness = 0.33f;
-    float wallScale = 26.f;          // metres per feature at the coarsest octave
-    int32_t wallOctaves = 3;
+    float wallRoughness = 0.36f;
+    // Feature size is a multiple of the *local* radius, not a fixed distance.
+    // A fixed 26 m coarsest octave meant a 3 m passage was modulated by
+    // features longer than it was wide, which is a gentle bend, not texture.
+    // Relative scale gives every passage the same number of features across
+    // its bore whatever its size -- which is what self-similar means.
+    float wallScaleFactor = 2.0f;    // coarsest octave, in local radii
+    int32_t wallOctaves = 4;
+    // Rock is bedded, and the ledges and shelves that reads as are the single
+    // strongest cue that a wall is stone rather than a mesh. Sampling the
+    // field squashed in Y makes its features wide and flat.
+    float wallBedding = 1.8f;
 
     // How far the rock field bends a passage as it is walked. Without it the
     // route is a pure random walk, which reads as smooth because nothing

@@ -199,8 +199,51 @@ struct DensityGenerator::Impl {
     }
 };
 
+void applyWorldScale(TerrainParams& p) {
+    const float s = p.worldScale;
+    if (s <= 0.f || s == 1.f) { p.worldScale = 1.f; return; }
+    const float inv = 1.f / s;
+
+    // Horizontal wavelengths and the heights they carry, divided together so
+    // every slope in the world comes out exactly as it was.
+    p.continentalScale *= inv;
+    p.mountainMaskScale *= inv;
+    p.ridgeScale *= inv;
+    p.ridgeHeight *= inv;
+    p.hillScale *= inv;
+    p.hillHeight *= inv;
+    p.overhangScale *= inv;
+    p.overhangAmpPlains *= inv;
+    p.overhangAmpMountains *= inv;
+    p.bedrockY *= inv;
+    p.coarseCaveDepth *= inv;
+    p.seaLevel *= inv;
+
+    p.stripe.cellSize *= inv;
+    p.stripe.stripeWidth *= inv;
+    p.stripe.amplitude *= inv;
+    p.stripe.gradEps *= inv;      // the hillside this measures is smaller too
+
+    // Caves: the network's footprint shrinks, its bore does not. Region size
+    // goes with the land so caves stay as common per metre walked.
+    p.cave.regionSize *= inv;
+    p.cave.maxDepth *= inv;
+    p.cave.bedrockY *= inv;
+    p.cave.routeScale *= inv;     // bends per step, not per metre
+    // Route vertices have to stay well apart compared with the bore, or
+    // consecutive capsules overlap so heavily that the passage is a smooth
+    // tube again -- the shortening stops where that would start.
+    p.cave.stepLength = std::max(p.cave.stepLength * inv, p.cave.tunnelRadius * 3.f);
+
+    p.worldScale = 1.f;
+}
+
+namespace {
+TerrainParams scaled(TerrainParams p) { applyWorldScale(p); return p; }
+}
+
 DensityGenerator::DensityGenerator(const TerrainParams& params)
-    : m_params(params), m_impl(std::make_unique<Impl>(params)) {}
+    : m_params(scaled(params)), m_impl(std::make_unique<Impl>(m_params)) {}
 DensityGenerator::~DensityGenerator() = default;
 
 const char* DensityGenerator::backendName() const {

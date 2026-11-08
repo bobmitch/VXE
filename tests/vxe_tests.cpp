@@ -761,8 +761,13 @@ TEST(jolt_collision_from_baked_terrain) {
     const BodyHandle ball = physics.createDynamicSphere({40.0, groundY + 5.0, 40.0}, 0.5f);
     for (int i = 0; i < 240; ++i) physics.step();
     const Vec3d p = physics.bodyPosition(ball);
-    std::printf("    ball rest y=%.2f ground=%.2f\n", p.y, groundY);
-    CHECK(p.y > groundY - 1.0 && p.y < groundY + 3.0);
+    // Against the ground under where it *stopped*, not where it was dropped: a
+    // ball on a slope rolls, and how far it rolls is a property of the
+    // landscape, not of whether the collision mesh is there. Comparing with
+    // the drop point made this test a terrain-shape assertion in disguise.
+    const double restGround = gen.sampleHeight(float(p.x), float(p.z));
+    std::printf("    ball rest y=%.2f ground under it=%.2f (dropped at %.2f)\n", p.y, restGround, groundY);
+    CHECK(p.y > restGround - 1.0 && p.y < restGround + 3.0);
 }
 #endif
 

@@ -1409,6 +1409,7 @@ int main(int argc, char** argv) {
     bool pipeStats = false;         // count pixel shader invocations: overdraw
     bool stripes = false;           // gradient-aligned stripe erosion on the heights
     float stripeAmp = 5.f, stripeWidth = 60.f;
+    float worldScale = TerrainParams{}.worldScale;
     float digRadiusStart = 5.f;     // metres; - / = adjust it at runtime
     bool walk = false;              // first-person: eye height above the ground, no flying
     float eyeHeight = 2.f, walkSpeed = 4.5f;
@@ -1453,6 +1454,7 @@ int main(int argc, char** argv) {
         else if (a == "--tess-px") tessTargetPx = float(next(tessTargetPx));
         else if (a == "--stripe-amp") stripeAmp = float(next(stripeAmp));
         else if (a == "--stripe-width") stripeWidth = float(next(stripeWidth));
+        else if (a == "--world-scale") worldScale = float(next(worldScale));
         else if (a == "--stats") pipeStats = true;
         else if (a == "--trace-lod") traceLod = int(next(traceLod));
         else if (a == "--skirt") skirtCells = float(next(4.5));
@@ -1465,6 +1467,7 @@ int main(int argc, char** argv) {
             std::printf("usage: vxe_viewer [--view M] [--maxlod N] [--seed N] [--width N] [--height N] [--novsync]\n"
                         "                  [--free] [--cam X Y Z YAW PITCH] [--lod-tint] [--wireframe]\n"
                         "                  [--no-skirts] [--skirt CELLS] [--no-sort] [--stats]\n"
+                        "                  [--world-scale N]  (N:1 shrink -- same shapes, shorter walk)\n"
                         "                  [--far-trace] [--trace-lod N]   (far-trace wants --maxlod == --trace-lod)\n"
                         "                  [--screenshot FILE.png] [--screenshot-at SECONDS] [--exit-after SECONDS]\n");
             return 0;
@@ -1714,6 +1717,14 @@ int main(int argc, char** argv) {
     Com<ID3D11DepthStencilState> dssFar;
     device->CreateDepthStencilState(&dsd, dssFar.put());
 
+    // Micro-relief is terrain too, and it did not shrink with the rest of it.
+    // Its wavelengths are deliberately left alone -- they are the finest tier,
+    // already near the sample spacing, and shrinking them would give sandpaper
+    // that aliases. Only the amplitude scales, which is what was wrong: a
+    // 0.62 m bump against a hill a third of its old height is three times the
+    // hill it used to be, and that reads as coarse however fine the noise is.
+    dispAmp /= std::max(worldScale, 0.01f);
+
     // ---- Engine --------------------------------------------------------------
     TaskSystem tasks;
     TerrainParams terrainParams;
@@ -1732,7 +1743,11 @@ int main(int argc, char** argv) {
                     terrainParams.stripe.octaves, double(stripeAmp), double(stripeWidth),
                     double(stripeMaxOffset(terrainParams.stripe)));
     }
+    terrainParams.worldScale = worldScale;
     DensityGenerator generator(terrainParams);
+    if (worldScale != 1.f)
+        std::printf("world      : 1:%.1f -- same shapes and slopes, %.0f%% of the walk, %.2f m micro-relief\n",
+                    double(worldScale), 100.0 / double(worldScale), double(dispAmp));
     DeltaStore deltas;
 
     StreamerConfig sc;

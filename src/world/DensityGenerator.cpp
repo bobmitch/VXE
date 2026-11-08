@@ -375,7 +375,7 @@ ChunkGenStats DensityGenerator::generate(const ChunkKey& key, DensityField& out)
                 const Aabbf grown{sysRef.bounds.min - Vec3f(reach), sysRef.bounds.max + Vec3f(reach)};
                 if (!grown.intersects(chunkBounds)) continue;
                 if (!anyCave) { std::fill(sc.caveSdf.begin(), sc.caveSdf.end(), 1e30f); anyCave = true; }
-                splatCaves(sysRef, origin, step, S, caveGrow, kDensityClamp, sc.caveSdf.data());
+                splatCaves(p.cave, sysRef, origin, step, S, caveGrow, kDensityClamp, sc.caveSdf.data());
             }
     }
     stats.evaluated3D = overhangBand || anyCave;
@@ -482,7 +482,8 @@ float DensityGenerator::sampleDensity(const Vec3i& v) const {
         for (int32_t dz = -r; dz <= r; ++dz)
             for (int32_t dx = -r; dx <= r; ++dx) {
                 const CaveSystem& sysRef = cachedSystem(cx + dx, cz + dz);
-                if (!sysRef.empty()) caveSdf = std::min(caveSdf, caveDistance(sysRef, {x, y, z}, 0.f));
+                if (!sysRef.empty())
+                    caveSdf = std::min(caveSdf, caveDistance(p.cave, sysRef, {x, y, z}, 0.f, world::kVoxelSize));
             }
     }
     float d; MaterialId m;

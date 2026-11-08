@@ -91,6 +91,21 @@ struct CaveParams {
     // widenings, rather than a tube of constant bore.
     float radiusWander = 0.6f;
 
+    // Wall roughness. A capsule is a machined tube and an ellipsoid is a
+    // sphere; what makes either read as rock is that the wall itself is
+    // irregular. Displacement is a fraction of the *local* radius, so a wide
+    // chamber gets metres of relief and a narrow passage gets centimetres and
+    // does not pinch itself shut.
+    float wallRoughness = 0.33f;
+    float wallScale = 26.f;          // metres per feature at the coarsest octave
+    int32_t wallOctaves = 3;
+
+    // How far the rock field bends a passage as it is walked. Without it the
+    // route is a pure random walk, which reads as smooth because nothing
+    // correlates between one step and the next.
+    float routeChaos = 0.95f;
+    float routeScale = 220.f;        // metres per bend
+
     // Entrance search: candidates per cell, and how much lower than the cell's
     // mean a candidate has to sit before it counts as somewhere water collects.
     int32_t entranceCandidates = 24;
@@ -139,14 +154,14 @@ CaveSystem buildCaveSystem(const CaveParams& p, int32_t seed, int32_t cellX, int
 // Signed distance to the nearest passage or chamber, negative inside. `grow`
 // widens everything by that many metres, which is how a passage narrower than
 // the sample spacing is kept alive at coarse LOD.
-float caveDistance(const CaveSystem& sys, const Vec3f& p, float grow);
+float caveDistance(const CaveParams& cp, const CaveSystem& sys, const Vec3f& p, float grow, float sampleStep);
 
 // Rasterises the system into `out`, an n^3 field of signed distances indexed
 // x + n*(y + n*z), keeping the minimum where it already holds something nearer.
 // Only samples within `clampDist` of a passage are touched, so the cost follows
 // how much cave is in the chunk rather than how many samples the chunk has --
 // which matters because most chunks contain none at all.
-void splatCaves(const CaveSystem& sys, const Vec3f& origin, float step, int32_t n, float grow, float clampDist,
-                float* out);
+void splatCaves(const CaveParams& cp, const CaveSystem& sys, const Vec3f& origin, float step, int32_t n,
+                float grow, float clampDist, float* out);
 
 } // namespace vxe

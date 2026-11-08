@@ -8,6 +8,42 @@
 namespace vxe {
 namespace {
 
+// A field standing in for how readily the rock gives way -- joint spacing,
+// bedding, whatever is softer than its neighbours. One field does two jobs:
+// it steers the passages while they are being walked, and it roughens their
+// walls afterwards, so the wobble in a wall and the bend in the passage come
+// from the same cause rather than looking like two effects stacked.
+float valueNoise3(const Vec3f& p, int32_t seed) {
+    const float fx = std::floor(p.x), fy = std::floor(p.y), fz = std::floor(p.z);
+    const int32_t ix = int32_t(fx), iy = int32_t(fy), iz = int32_t(fz);
+    const float tx = p.x - fx, ty = p.y - fy, tz = p.z - fz;
+    const float ux = tx * tx * (3.f - 2.f * tx), uy = ty * ty * (3.f - 2.f * ty), uz = tz * tz * (3.f - 2.f * tz);
+    const auto corner = [&](int32_t dx, int32_t dy, int32_t dz) {
+        return det::unit(det::hash3(ix + dx, iy + dy, iz + dz, seed));
+    };
+    const float c00 = corner(0, 0, 0) + (corner(1, 0, 0) - corner(0, 0, 0)) * ux;
+    const float c10 = corner(0, 1, 0) + (corner(1, 1, 0) - corner(0, 1, 0)) * ux;
+    const float c01 = corner(0, 0, 1) + (corner(1, 0, 1) - corner(0, 0, 1)) * ux;
+    const float c11 = corner(0, 1, 1) + (corner(1, 1, 1) - corner(0, 1, 1)) * ux;
+    const float c0 = c00 + (c10 - c00) * uy, c1 = c01 + (c11 - c01) * uy;
+    return c0 + (c1 - c0) * uz;
+}
+
+// Signed, roughly [-1, 1]. `minWavelength` drops octaves finer than the samples
+// can carry: a wall detail below the sample spacing is not detail, it is noise
+// that changes shape at every LOD.
+float rockField(const Vec3f& p, float scale, int32_t octaves, float minWavelength, int32_t seed) {
+    float sum = 0.f, amp = 1.f, norm = 0.f, wavelength = scale;
+    for (int32_t o = 0; o < octaves; ++o) {
+        if (wavelength < minWavelength) break;
+        sum += (valueNoise3(p * (1.f / wavelength), seed + o * 7717) * 2.f - 1.f) * amp;
+        norm += amp;
+        amp *= 0.52f;
+        wavelength *= 0.45f;
+    }
+    return norm > 0.f ? sum / norm : 0.f;
+}
+
 // Distance to a capsule, with the radius interpolated along it.
 float capsuleDistance(const Vec3f& p, const CaveSegment& s) {
     const Vec3f ab = s.b - s.a;
@@ -116,7 +152,11 @@ void walk(const CaveParams& p, det::Stream& rs, const Vec3f& from, float bearing
         // Wander. Scaled by depth so the first few steps stay near the bearing
         // the surface handed us and the passage reads as going *in* somewhere.
         const float settle = std::min(1.f, float(i) * 0.25f);
-        yaw += rs.range(-p.turnRate, p.turnRate) * settle;
+        // The rock steers as well as roughens. Because this is a field rather
+        // than a dice roll, passages in the same ground bend the same way, and
+        // a route reads as following something instead of wandering at random.
+        const float bend = rockField(cur, p.routeScale, 2, 0.f, 0x2B17) * p.routeChaos;
+        yaw += (rs.range(-p.turnRate, p.turnRate) + bend) * settle;
 
         const float step = p.stepLength * rs.range(0.75f, 1.25f);
         const float drop = step * descent * rs.range(0.5f, 1.4f);
@@ -227,10 +267,14 @@ CaveSystem buildCaveSystem(const CaveParams& p, int32_t seed, int32_t cellX, int
     return sys;
 }
 
-void splatCaves(const CaveSystem& sys, const Vec3f& origin, float step, int32_t n, float grow, float clampDist,
-                float* out) {
+void splatCaves(const CaveParams& cp, const CaveSystem& sys, const Vec3f& origin, float step, int32_t n,
+                float grow, float clampDist, float* out) {
     const float invStep = 1.f / step;
-    const auto rasterise = [&](const Vec3f& lo, const Vec3f& hi, auto&& distance) {
+    // Finest wall detail the samples can carry. Below this it is not detail,
+    // it is a different shape at every LOD.
+    const float minWave = step * 2.2f;
+    const auto rasterise = [&](const Vec3f& lo, const Vec3f& hi, float localRadius, auto&& distance) {
+        const float rough = localRadius * cp.wallRoughness;
         const int32_t x0 = std::max(0, int32_t(std::floor((lo.x - origin.x) * invStep)));
         const int32_t y0 = std::max(0, int32_t(std::floor((lo.y - origin.y) * invStep)));
         const int32_t z0 = std::max(0, int32_t(std::floor((lo.z - origin.z) * invStep)));
@@ -243,7 +287,12 @@ void splatCaves(const CaveSystem& sys, const Vec3f& origin, float step, int32_t 
                 for (int32_t x = x0; x <= x1; ++x) {
                     const Vec3f p{origin.x + float(x) * step, origin.y + float(y) * step,
                                   origin.z + float(z) * step};
-                    const float d = distance(p) - grow;
+                    float d = distance(p) - grow;
+                    // Only the shell around the wall needs the field; deep rock
+                    // and open air are decided already, and the noise is the
+                    // expensive part of this loop.
+                    if (rough > 0.01f && d > -rough - step && d < rough + step)
+                        d += rockField(p, cp.wallScale, cp.wallOctaves, minWave, 0x51F) * rough;
                     float& dst = out[row + size_t(x)];
                     if (d < dst) dst = d;
                 }
@@ -251,21 +300,37 @@ void splatCaves(const CaveSystem& sys, const Vec3f& origin, float step, int32_t 
     };
 
     for (const CaveSegment& s : sys.segments) {
-        const float pad = std::max(s.ra, s.rb) + grow + clampDist;
-        rasterise(vmin(s.a, s.b) - Vec3f(pad), vmax(s.a, s.b) + Vec3f(pad),
+        const float r = std::max(s.ra, s.rb);
+        const float pad = r * (1.f + cp.wallRoughness) + grow + clampDist;
+        rasterise(vmin(s.a, s.b) - Vec3f(pad), vmax(s.a, s.b) + Vec3f(pad), r,
                   [&](const Vec3f& p) { return capsuleDistance(p, s); });
     }
     for (const CaveChamber& c : sys.chambers) {
-        const Vec3f pad = c.radii + Vec3f(grow + clampDist);
-        rasterise(c.centre - pad, c.centre + pad, [&](const Vec3f& p) { return chamberDistance(p, c); });
+        const float r = std::min(c.radii.x, std::min(c.radii.y, c.radii.z));
+        const Vec3f pad = c.radii * (1.f + cp.wallRoughness) + Vec3f(grow + clampDist);
+        rasterise(c.centre - pad, c.centre + pad, r,
+                  [&](const Vec3f& p) { return chamberDistance(p, c); });
     }
 }
 
-float caveDistance(const CaveSystem& sys, const Vec3f& p, float grow) {
-    float d = 1e30f;
-    for (const CaveSegment& s : sys.segments) d = std::min(d, capsuleDistance(p, s));
-    for (const CaveChamber& c : sys.chambers) d = std::min(d, chamberDistance(p, c));
-    return d - grow;
+float caveDistance(const CaveParams& cp, const CaveSystem& sys, const Vec3f& p, float grow, float sampleStep) {
+    // Tracks the splat: nearest primitive first, then that primitive's own
+    // radius sets how much the wall may wander. Edits and queries have to see
+    // the same wall the mesher did.
+    float d = 1e30f, radius = 0.f;
+    for (const CaveSegment& s : sys.segments) {
+        const float c = capsuleDistance(p, s);
+        if (c < d) { d = c; radius = std::max(s.ra, s.rb); }
+    }
+    for (const CaveChamber& c : sys.chambers) {
+        const float e = chamberDistance(p, c);
+        if (e < d) { d = e; radius = std::min(c.radii.x, std::min(c.radii.y, c.radii.z)); }
+    }
+    d -= grow;
+    const float rough = radius * cp.wallRoughness;
+    if (rough > 0.01f && d > -rough - sampleStep && d < rough + sampleStep)
+        d += rockField(p, cp.wallScale, cp.wallOctaves, sampleStep * 2.2f, 0x51F) * rough;
+    return d;
 }
 
 } // namespace vxe

@@ -2,7 +2,7 @@
 
 **Status: working draft.** Sections are tagged **[decided]**, **[proposed]** or **[open]**. Only the
 tagged-decided parts are settled; everything else is a starting position to argue with. Nothing here
-is implemented yet, apart from the one item in §9 marked **[done]**.
+is implemented yet, apart from the items in §9 marked **[done]**.
 
 This document exists because world generation is about to become the long pole, and the generator
 cannot be designed without knowing what the player is supposed to meet. Every section below ends in
@@ -905,7 +905,7 @@ dungeons and Minecraft's structures both sit on the wrong side of that line. We 
 
 ### What noise cannot do
 
-Four failures, in order of what they cost:
+Five failures, in order of what they cost:
 
 1. **It cannot make biomes differ.** Noise is stationary — the same statistics everywhere, by
    construction. §5 asks the Hollows for karst and the cinder flats for "long, smooth, rarely
@@ -924,6 +924,14 @@ Four failures, in order of what they cost:
    Entrances pop in, nothing underground is observable at range (§7), and the navigation graph (§6)
    has nothing to work with beyond the live area. This is the shallow end of a larger problem that is
    not about caves at all, and the next subsection measures it.
+5. **It gets dearer with distance, not cheaper.** Measured, over a 7 × 3 × 7 block of chunks:
+   carrying the cave fields outward costs 4–6× the triangles of solid rock at every level — 637k
+   against 158k at LOD2, 1,012k against 208k at LOD3, 1,320k against 214k at LOD4 — before any
+   attempt to keep the voids alive. Thresholded noise does not coarsen into fewer, larger voids; it
+   **fragments into blobs**, so spreading the samples out multiplies surface area instead of
+   reducing it. A parametric void inverts that: one capsule is one capsule at every level, and
+   carving it at a coarse stride yields fewer triangles, not more. LOD is supposed to be the thing
+   that buys distance; against noise caves it is a bill.
 
 ### Voids do not survive coarsening
 
@@ -985,6 +993,22 @@ enough, and is the default. Weighting air samples above solid ones buys roughly 
 survival and costs stability at the level below, so it is exposed as a knob rather than chosen.
 Dual contouring's QEF keeps edges sharp once the data is there; the data was what was missing.
 
+**[done, partly]** Mechanism 2 has a stopgap rather than an answer. Caves now reach LOD3 instead of
+stopping at LOD1, and since `caveSdf` is already a distance in metres they are dilated as the
+samples spread out, so a tunnel thins rather than vanishing. That matters most for *where* the
+remaining cutoff sits: it was at roughly 256 m, barely ahead of the player, and is now at roughly
+1 km. The original artifact was never individual holes blinking — it was a ring sweeping across the
+landscape along the LOD1|LOD2 boundary, the whole world changing character along a moving line,
+which is why procedural gaps read so much worse than a dug crater ever did.
+
+It is a trade and not a fix, in three ways worth writing down. Caves read too fat at range and
+tighten as you approach. Dilating an SDF grows *every* negative region, so rock thinner than the
+dilation erodes and near-miss tunnels join up — topology at range is not the topology underfoot.
+And it is expensive in exactly the way failure 5 predicts: the demo's initial stream goes from
+2.90 M triangles to 5.78 M, and LOD4 was left solid because caves there cost 12× for a void that is
+sub-pixel at the kilometre such a chunk implies. The frame cost is nil — 59.8 fps either way, with
+the price landing on upload bandwidth and generation time instead.
+
 ### This is not an argument for a different architecture
 
 The obvious reading of the above is that the chunked-LOD scheme is at fault and that something
@@ -1011,8 +1035,10 @@ revisions is a harder problem than the one it would be solving — and Jolt want
 regardless, so a GPU-only mesh path still owes a readback or a second path for collision.
 
 **Keep the architecture; fix the data production.** In order: delta reduction, which addresses what
-was actually observed and is contained enough to carry a regression test — now done; then parametric
-cave incursions, which retire `maxCaveLod`; then prefiltering the surface noise, before mechanism 3
+was actually observed and is contained enough to carry a regression test — done; carrying caves
+outward at all, which was the loudest artifact and is now bought cheaply, if dearly in triangles;
+then parametric cave incursions, which retire `maxCaveLod` properly and are the only thing that
+makes distance a saving rather than a bill; then prefiltering the surface noise, before mechanism 3
 is noticed in the Badlands. GPU meshing remains available later as a throughput decision, which is
 what it always was.
 
@@ -1103,7 +1129,8 @@ Two consequences land immediately:
   customers before a single chunk is meshed. The cave graph is a strong candidate to *be* §6's coarse
   navigation graph underground, rather than a second structure that has to agree with it.
 * **Caves at every LOD**, retiring `maxCaveLod` and making an entrance something that can be seen
-  before it is stood in.
+  before it is stood in. Half-done: the cutoff has moved from ~256 m to ~1 km by dilating the voids
+  as the stride grows, but it is still a cutoff, and the dilation changes topology at range.
 * **Entrance placement as a first-class output**, not a shell term. How a player finds the
   underground is §7's legibility problem one level down, and it is currently answered by a noise
   field.

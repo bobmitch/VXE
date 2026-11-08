@@ -354,13 +354,25 @@ float dispFadeAt(float dist)
     return 1.0 - saturate((dist - gDispFar) / max(gDispFade, 1e-3));
 }
 
-// Micro-relief in metres, before amplitude. Steep faces get more of it than
-// ground you are meant to walk on.
+// Micro-relief in metres, before amplitude.
+//
+// Three octaves with a ridged middle one, so the result is cragged rather than
+// a field of smooth lumps: smoothing alone just trades flat facets for soft
+// ones, and rock up close wants creases and broken edges.
+//
+// Weighted hard toward steep faces. That is where the silhouette is -- the
+// surface is edge-on there, so displacement along the normal moves the outline
+// itself, which is the only thing that stops a ridge reading as polygonal --
+// and it is not ground anyone has to walk on. Flat ground keeps a quarter of
+// it so it does not look like a different material.
 float microRelief(float3 wp, float3 n)
 {
-    float h = (valueNoise(wp * 0.6) - 0.5) + (valueNoise(wp * 1.9) - 0.5) * 0.45;
+    const float h = valueNoise(wp * 0.45) - 0.5;
+    const float r = 0.5 - abs(valueNoise(wp * 1.3) - 0.5) * 2.0;    // ridged: creases, not bumps
+    const float d = (valueNoise(wp * 3.1) - 0.5) * 0.35;
+    const float relief = h + r * 0.55 + d;
     const float steep = 1.0 - saturate(n.y);
-    return h * (0.5 + 0.9 * steep);
+    return relief * (0.55 + 1.5 * steep * steep);
 }
 
 struct PatchConst { float edges[3] : SV_TessFactor; float inside : SV_InsideTessFactor; };
@@ -413,7 +425,7 @@ VSOut DSMain(PatchConst pc, float3 bary : SV_DomainLocation, const OutputPatch<C
         // bumps that catch the light as if they were flat.
         const float3 t1 = normalize(abs(nrm.y) < 0.9 ? cross(nrm, float3(0, 1, 0)) : cross(nrm, float3(1, 0, 0)));
         const float3 t2 = cross(nrm, t1);
-        const float e = 0.4;
+        const float e = 0.22;        // tighter than the finest octave, or the normal misses it
         const float h1 = microRelief(world + t1 * e, nrm);
         const float h2 = microRelief(world + t2 * e, nrm);
         camRel += nrm * (h0 * amp);
@@ -1234,8 +1246,14 @@ int main(int argc, char** argv) {
     bool walk = false;              // first-person: eye height above the ground, no flying
     float eyeHeight = 2.f, walkSpeed = 4.5f;
     bool tess = false;              // hardware tessellation + micro-relief up close
-    float dispAmp = 0.45f;          // metres; kept under step height, see below
-    float dispFar = 90.f, tessTargetPx = 14.f, tessMax = 7.f;
+    // 0.8 m peak, but the steep weighting means walkable ground sees about a
+    // quarter of that and near-vertical rock the rest -- so the figure that has
+    // to stay under step height is the flat-ground one, not this.
+    float dispAmp = 0.8f;
+    // Reach matters as much as amplitude for silhouettes: a ridge is usually
+    // further off than the ground you are standing on, and gets no detail at
+    // all once the tessellation factor falls back to 1.
+    float dispFar = 150.f, tessTargetPx = 9.f, tessMax = 12.f;
     int traceLod = 3;               // first LOD handed over as density instead of geometry
     bool fixedCam = false;
     double camArgs[5] = {};         // x y z yaw pitch (degrees)

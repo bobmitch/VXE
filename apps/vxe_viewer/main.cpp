@@ -134,6 +134,37 @@ Mat4 viewFromBasis(const Vec3f& right, const Vec3f& up, const Vec3f& fwd) {
     return v;
 }
 
+// Three cascades at 2048^2. Three because the splits below put the first one
+// inside 150 m, where contact shadows and cave mouths live, and a fourth would
+// buy resolution only past 1.8 km, where a shadow is smaller than a pixel.
+constexpr int kCascades = 3;
+constexpr UINT kShadowSize = 2048;
+
+// Same convention, but the light does sit somewhere: a cascade is fitted around
+// a slice of the view frustum, and its eye is pushed back along the sun so that
+// whatever stands between the slice and the sun is still in the map.
+Mat4 lightView(const Vec3f& eye, const Vec3f& right, const Vec3f& up, const Vec3f& fwd) {
+    Mat4 v = viewFromBasis(right, up, fwd);
+    v.m[3][0] = -dot(eye, right);
+    v.m[3][1] = -dot(eye, up);
+    v.m[3][2] = -dot(eye, fwd);
+    return v;
+}
+
+// Symmetric orthographic, left-handed, z into [0, 1]. Not reverse-Z: a shadow
+// map spans a few hundred metres with a near plane that is actually near, so
+// the precision argument that drives the main pass does not apply, and a plain
+// depth test keeps the comparison sampler's LESS_EQUAL meaning what it says.
+Mat4 orthoLH(float radius, float zNear, float zFar) {
+    Mat4 p;
+    p.m[0][0] = 1.f / radius;
+    p.m[1][1] = 1.f / radius;
+    p.m[2][2] = 1.f / (zFar - zNear);
+    p.m[3][2] = -zNear / (zFar - zNear);
+    p.m[3][3] = 1.f;
+    return p;
+}
+
 // Gribb/Hartmann plane extraction for the row-vector convention: the planes are
 // combinations of the *columns* of viewProj. Near/far come from the camera basis
 // instead, because the infinite reverse-Z matrix degenerates there.
@@ -175,6 +206,14 @@ cbuffer Frame : register(b0)
     float  gDispFar;       float gDispFade;       // displacement fades out over this band
     float  gDispAmp;       float gTessMax;
     float  gPad3;          float gPad4;
+    // Cascades, fitted in camera-relative space so the camRel the shading
+    // already has indexes them directly -- no world position to narrow, and
+    // nothing lost at range.
+    row_major float4x4 gShadowMat[3];
+    float4 gShadowSplit;   // xyz = far distance of each cascade
+    float4 gShadowTexel;   // xyz = world metres per shadow texel, per cascade
+    float4 gShadowBias;    // xyz = depth bias in this cascade's own NDC units
+    float4 gShadowParam;   // x strength, y unused, z normal offset in texels, w 1/mapSize
 };
 
 cbuffer Chunk : register(b1)
@@ -252,6 +291,50 @@ float3 skyColor(float3 dir)
     return sky + gSunColor * sun * 1.4;
 }
 
+// Depth-only pass, one draw per cascade. No tessellation: the displacement is
+// a fraction of a metre and a shadow map cannot resolve it, so paying for the
+// hull and domain stages three more times would buy nothing.
+cbuffer ShadowPass : register(b4) { row_major float4x4 gLightViewProj; };
+float4 VSShadow(VSIn i) : SV_Position
+{
+    return mul(float4(i.pos + gChunkOffset, 1.0), gLightViewProj);
+}
+
+Texture2DArray<float>  gShadowMap  : register(t3);
+SamplerComparisonState gShadowSamp : register(s2);
+
+// How much of the sun reaches this point. Underground this is what has been
+// missing entirely: the only thing darkening a cave was a one-voxel cavity
+// term from the mesher, so a wall 150 m down facing the sun was lit through
+// the rock. A cascade records the depth of whatever is above a point, so the
+// cave, the overhang and the underside of an arch all fall out of one test.
+float sunVisibility(float3 camRel, float3 n, float ndl)
+{
+    if (gShadowParam.x <= 0.0) return 1.0;
+    const float dist = length(camRel);
+    if (dist >= gShadowSplit.z) return 1.0;                 // beyond the last cascade
+    const int c = dist < gShadowSplit.x ? 0 : (dist < gShadowSplit.y ? 1 : 2);
+
+    // Offset along the normal by a texel of *this* cascade before projecting.
+    // Depth bias alone either peters out on slopes or detaches the contact
+    // shadow, and the cascades differ in scale by 16x end to end.
+    const float texel = gShadowTexel[c];
+    const float4 sp = mul(float4(camRel + n * texel * gShadowParam.z, 1.0), gShadowMat[c]);
+    const float3 ndc = sp.xyz / sp.w;
+    const float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
+    if (any(uv != saturate(uv)) || ndc.z > 1.0) return 1.0;
+    // Slope-scaled: a face nearly edge-on to the sun spans many texels of depth
+    // across one texel of map, and a flat bias cannot cover both cases.
+    const float z = ndc.z - gShadowBias[c] * (1.0 + 3.0 * (1.0 - ndl));
+
+    float sum = 0.0;
+    [unroll] for (int j = -1; j <= 1; ++j)
+        [unroll] for (int k = -1; k <= 1; ++k)
+            sum += gShadowMap.SampleCmpLevelZero(gShadowSamp,
+                       float3(uv + float2(k, j) * gShadowParam.w, c), z);
+    return lerp(1.0, sum * (1.0 / 9.0), gShadowParam.x);
+}
+
 float4 PSMain(VSOut i) : SV_Target
 {
     const float3 n = normalize(i.nrm);
@@ -268,12 +351,17 @@ float4 PSMain(VSOut i) : SV_Target
     albedo *= lerp(0.62, 1.0, i.ao);
 
     const float  ndl  = saturate(dot(n, gSunDir));
-    const float3 sun  = gSunColor * ndl;
+    const float  vis  = sunVisibility(i.camRel, n, ndl);
+    // P: sun visibility straight to the screen. Shadow bugs are invisible under
+    // albedo and ambient -- the first attempt at this looked plausible and was
+    // sampling the far slope.
+    if (gShadowParam.y > 0.5) return float4(vis.xxx, 1.0);
+    const float3 sun  = gSunColor * ndl * vis;
     // Hemisphere ambient + a dim bounce from below, so cave roofs are not black.
     const float3 amb  = lerp(float3(0.10, 0.10, 0.12), gSkyTop * 0.55, saturate(n.y * 0.5 + 0.5));
     // Wrapped specular sheen, enough to read the silhouette of ridges.
     const float3 h    = normalize(gSunDir + v);
-    const float  spec = pow(saturate(dot(n, h)), 24.0) * 0.06 * ndl;
+    const float  spec = pow(saturate(dot(n, h)), 24.0) * 0.06 * ndl * vis;
 
     float3 color = albedo * (sun + amb) + spec;
 
@@ -1180,8 +1268,16 @@ struct FrameCB {
     float dispFar;       float dispFade;
     float dispAmp;       float tessMax;
     float pad3;          float pad4;
+    float shadowMat[3][16];
+    float shadowSplit[4];
+    float shadowTexel[4];
+    float shadowBias[4];
+    float shadowParam[4];
 };
 static_assert(sizeof(FrameCB) % 16 == 0);
+
+struct ShadowCB { float lightViewProj[16]; };
+static_assert(sizeof(ShadowCB) % 16 == 0);
 
 struct ChunkCB {
     float offset[3];
@@ -1376,6 +1472,7 @@ void printControls() {
         "  V            toggle walking: eyes 2 m above the ground, no flying\n"
         "  T            toggle tessellation (only with --tess)\n"
         "  K            show / hide the markers over cave entrances\n"
+        "  O            sun shadows on / off (3 cascades)\n"
         "  click / Tab  capture the mouse (free look).  Tab or Esc releases it\n"
         "  W A S D      move,  Q / E  down / up\n"
         "  Shift        x8 speed,  Ctrl  x1/5 speed,  mouse wheel  set base speed\n"
@@ -1410,6 +1507,7 @@ int main(int argc, char** argv) {
     bool stripes = false;           // gradient-aligned stripe erosion on the heights
     float stripeAmp = 5.f, stripeWidth = 60.f;
     float worldScale = TerrainParams{}.worldScale;
+    bool shadows = true, shadowView = false;
     float digRadiusStart = 5.f;     // metres; - / = adjust it at runtime
     bool walk = false;              // first-person: eye height above the ground, no flying
     float eyeHeight = 2.f, walkSpeed = 4.5f;
@@ -1455,6 +1553,8 @@ int main(int argc, char** argv) {
         else if (a == "--stripe-amp") stripeAmp = float(next(stripeAmp));
         else if (a == "--stripe-width") stripeWidth = float(next(stripeWidth));
         else if (a == "--world-scale") worldScale = float(next(worldScale));
+        else if (a == "--no-shadows") shadows = false;
+        else if (a == "--shadow-view") shadowView = true;
         else if (a == "--stats") pipeStats = true;
         else if (a == "--trace-lod") traceLod = int(next(traceLod));
         else if (a == "--skirt") skirtCells = float(next(4.5));
@@ -1596,6 +1696,11 @@ int main(int argc, char** argv) {
         return 1;
     if (farTrace && !compile("PSFar", "ps_5_0", farPsBlob)) return 1;
 
+    Com<ID3DBlob> shVsBlob;
+    Com<ID3D11VertexShader> shadowVs;
+    if (!compile("VSShadow", "vs_5_0", shVsBlob)) return 1;
+    device->CreateVertexShader(shVsBlob->GetBufferPointer(), shVsBlob->GetBufferSize(), nullptr, shadowVs.put());
+
     Com<ID3DBlob> ovVsBlob, ovPsBlob;
     Com<ID3D11VertexShader> ovVs;
     Com<ID3D11PixelShader> ovPs;
@@ -1716,6 +1821,78 @@ int main(int argc, char** argv) {
     dsd.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
     Com<ID3D11DepthStencilState> dssFar;
     device->CreateDepthStencilState(&dsd, dssFar.put());
+
+    // ---- Shadow cascades -----------------------------------------------------
+    // One depth array, one slice per cascade, plain forward depth.
+    //
+    // Cull mode is the whole thing here. The usual trick is to cull front faces
+    // so the self-shadowing error lands behind the surface -- but that is for
+    // closed solids seen from outside. From the *light's* view the slope facing
+    // the sun is the front face, and it is the only occluder that matters, so
+    // culling it records the far slope's depth instead: no shadow where there
+    // should be one, and a spurious one where the ground turns away. Back-face
+    // culling keeps the first thing the light actually hits.
+    Com<ID3D11Texture2D> shadowTex;
+    Com<ID3D11DepthStencilView> shadowDsv[kCascades];
+    Com<ID3D11ShaderResourceView> shadowSrv;
+    Com<ID3D11SamplerState> shadowSamp;
+    Com<ID3D11DepthStencilState> dssShadow;
+    Com<ID3D11RasterizerState> rsShadowPass;
+    Com<ID3D11Buffer> shadowCB;
+    {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = td.Height = kShadowSize;
+        td.MipLevels = 1;
+        td.ArraySize = kCascades;
+        td.Format = DXGI_FORMAT_R32_TYPELESS;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+        if (fail(device->CreateTexture2D(&td, nullptr, shadowTex.put()), "shadow CreateTexture2D")) return 1;
+
+        for (int c = 0; c < kCascades; ++c) {
+            D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+            dv.Format = DXGI_FORMAT_D32_FLOAT;
+            dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+            dv.Texture2DArray.FirstArraySlice = UINT(c);
+            dv.Texture2DArray.ArraySize = 1;
+            if (fail(device->CreateDepthStencilView(shadowTex.get(), &dv, shadowDsv[c].put()), "shadow DSV")) return 1;
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_R32_FLOAT;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        sv.Texture2DArray.MipLevels = 1;
+        sv.Texture2DArray.ArraySize = kCascades;
+        if (fail(device->CreateShaderResourceView(shadowTex.get(), &sv, shadowSrv.put()), "shadow SRV")) return 1;
+
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+        sd.BorderColor[0] = sd.BorderColor[1] = sd.BorderColor[2] = sd.BorderColor[3] = 1.f;
+        sd.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        if (fail(device->CreateSamplerState(&sd, shadowSamp.put()), "shadow sampler")) return 1;
+
+        D3D11_DEPTH_STENCIL_DESC sds{};
+        sds.DepthEnable = TRUE;
+        sds.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        sds.DepthFunc = D3D11_COMPARISON_LESS;      // forward depth here, not reverse
+        device->CreateDepthStencilState(&sds, dssShadow.put());
+
+        D3D11_RASTERIZER_DESC srd{};
+        srd.FillMode = D3D11_FILL_SOLID;
+        srd.CullMode = D3D11_CULL_BACK;
+        srd.FrontCounterClockwise = FALSE;
+        srd.DepthClipEnable = TRUE;
+        // Slope-scaled, because a face nearly edge-on to the sun covers far
+        // more depth per texel than a face square to it, and one constant
+        // cannot serve both without either acne or a detached contact.
+        srd.DepthBias = 120;
+        srd.SlopeScaledDepthBias = 2.5f;
+        device->CreateRasterizerState(&srd, rsShadowPass.put());
+
+        if (!makeCB(sizeof(ShadowCB), shadowCB)) return 1;
+    }
 
     // Micro-relief is terrain too, and it did not shrink with the rest of it.
     // Its wavelengths are deliberately left alone -- they are the finest tier,
@@ -1857,6 +2034,9 @@ int main(int argc, char** argv) {
     bool walkSnap = walk;          // first frame in walk mode places the feet rather than easing
     float digRadius = digRadiusStart;
     bool showBeacons = true;              // K: debug markers over cave mouths
+    bool shadowsOn = shadows;             // O: sun occlusion
+    bool shadowDebug = shadowView;        // P: show sun visibility only
+    uint64_t shadowDraws = 0;
     std::vector<Vec3f> caveMouths;
     double beaconRefresh = 1e9;           // seconds since the list was rebuilt
     TextOverlay overlay(device.get());
@@ -1881,6 +2061,24 @@ int main(int argc, char** argv) {
         qd.Query = D3D11_QUERY_PIPELINE_STATISTICS;
         if (FAILED(device->CreateQuery(&qd, statsQuery.put()))) return 1;
     }
+
+    // Wall-clock frame time stops meaning anything once the window is not being
+    // composited -- it reads 0.47 ms for a frame that plainly is not that, and
+    // it has been quoted in this project before it was noticed. Timestamps
+    // measure the GPU whatever the window manager is doing, which is the only
+    // honest way to price a pass. Read back three frames later so nothing stalls.
+    constexpr int kTimerRing = 4;
+    Com<ID3D11Query> tqDisjoint[kTimerRing], tqMark[kTimerRing][3];
+    {
+        D3D11_QUERY_DESC qd{};
+        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        for (auto& q : tqDisjoint) device->CreateQuery(&qd, q.put());
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        for (auto& row : tqMark)
+            for (auto& q : row) device->CreateQuery(&qd, q.put());
+    }
+    double gpuShadowMs = 0.0, gpuTotalMs = 0.0;
+    uint64_t gpuSamples = 0;
 
     printControls();
     std::printf("streaming the first ring of chunks...\n");
@@ -1940,6 +2138,14 @@ int main(int argc, char** argv) {
         if (g_input.takePress('K')) {
             showBeacons = !showBeacons;
             std::printf("cave markers: %s\n", showBeacons ? "on" : "off");
+        }
+        if (g_input.takePress('O')) {
+            shadowsOn = !shadowsOn;
+            std::printf("shadows    : %s\n", shadowsOn ? "on, 3 cascades at 2048" : "off");
+        }
+        if (g_input.takePress('P')) {
+            shadowDebug = !shadowDebug;
+            std::printf("shadow view: %s\n", shadowDebug ? "sun visibility" : "off");
         }
         if (g_input.takePress('V')) {
             walk = !walk;
@@ -2114,12 +2320,151 @@ int main(int argc, char** argv) {
         fcb.dispFar = dispFar;
         fcb.dispFade = dispFar * 0.45f;
         fcb.dispAmp = tessOn ? dispAmp : 0.f;
+
+        // ---- Fit the cascades --------------------------------------------------
+        // Each cascade wraps a slice of the view frustum in a sphere, which is
+        // what makes its extent independent of where the camera is looking:
+        // fit to the corners directly and the map resizes as you turn your
+        // head, and every shadow edge crawls.
+        struct Cascade { Mat4 viewProj; Vec3f ax, ay, fwd, eye; float radius, zFar; };
+        Cascade casc[kCascades];
+        const float splitD[kCascades + 1] = {zNear, 150.f, 520.f, 1800.f};
+        {
+            const Vec3f lightFwd = Vec3f{-sun.x, -sun.y, -sun.z};   // way the light travels
+            const Vec3f upRef = std::abs(lightFwd.y) > 0.95f ? Vec3f{0.f, 0.f, 1.f} : Vec3f{0.f, 1.f, 0.f};
+            const Vec3f ax = normalize(cross(upRef, lightFwd));
+            const Vec3f ay = cross(lightFwd, ax);
+            // Far enough back that anything standing between the slice and the
+            // sun is still in the map. A hill casts onto the valley behind it
+            // from well outside the slice.
+            constexpr float kCasterReach = 1400.f;
+            for (int c = 0; c < kCascades; ++c) {
+                Vec3f corner[8];
+                int k = 0;
+                for (int s = 0; s < 2; ++s) {
+                    const float d = splitD[c + s];
+                    const float ex = d * fcb.tanHalfFovX, ey = d * fcb.tanHalfFovY;
+                    for (int j = -1; j <= 1; j += 2)
+                        for (int i = -1; i <= 1; i += 2)
+                            corner[k++] = fwd * d + rightV * (ex * float(i)) + upV * (ey * float(j));
+                }
+                Vec3f centre{0.f, 0.f, 0.f};
+                for (const Vec3f& p : corner) centre = centre + p;
+                centre = centre * 0.125f;
+                float radius = 0.f;
+                for (const Vec3f& p : corner) radius = std::max(radius, length(p - centre));
+                radius = std::max(radius, 1.f);
+
+                // Snap the centre to whole texels, in *world* space -- the
+                // camera-relative origin moves every frame, so snapping to the
+                // local grid would snap to something that is itself sliding.
+                const float texel = 2.f * radius / float(kShadowSize);
+                const double cw[3] = {camera.position.x + double(centre.x), camera.position.y + double(centre.y),
+                                      camera.position.z + double(centre.z)};
+                const double sx = double(ax.x) * cw[0] + double(ax.y) * cw[1] + double(ax.z) * cw[2];
+                const double sy = double(ay.x) * cw[0] + double(ay.y) * cw[1] + double(ay.z) * cw[2];
+                const double offx = std::round(sx / double(texel)) * double(texel) - sx;
+                const double offy = std::round(sy / double(texel)) * double(texel) - sy;
+                centre = centre + ax * float(offx) + ay * float(offy);
+
+                const float zFar = 2.f * radius + kCasterReach;
+                const Vec3f eye = centre - lightFwd * (radius + kCasterReach);
+                casc[c] = {lightView(eye, ax, ay, lightFwd) * orthoLH(radius, 0.f, zFar),
+                           ax, ay, lightFwd, eye, radius, zFar};
+                std::memcpy(fcb.shadowMat[c], casc[c].viewProj.m, sizeof(casc[c].viewProj.m));
+                fcb.shadowSplit[c] = splitD[c + 1];
+                fcb.shadowTexel[c] = texel;
+                // A fixed bias in metres, expressed in each cascade's own depth
+                // range. One NDC constant across cascades is either useless in
+                // the near one or lifts the far one off the ground.
+                fcb.shadowBias[c] = 0.35f / zFar;
+            }
+            fcb.shadowParam[0] = shadowsOn ? 1.f : 0.f;
+            fcb.shadowParam[1] = shadowDebug ? 1.f : 0.f;
+            fcb.shadowParam[2] = 1.6f;                      // normal offset, in texels
+            fcb.shadowParam[3] = 1.f / float(kShadowSize);
+        }
         {
             D3D11_MAPPED_SUBRESOURCE map{};
             ctx->Map(frameCB.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
             std::memcpy(map.pData, &fcb, sizeof(fcb));
             ctx->Unmap(frameCB.get(), 0);
         }
+
+        const int tr = int(frameIndex % kTimerRing);
+        ctx->Begin(tqDisjoint[tr].get());
+        ctx->End(tqMark[tr][0].get());
+
+        if (frameIndex == 240)
+            std::printf("cascades   : radii %.0f / %.0f / %.0f m, texels %.2f / %.2f / %.2f m, splits %.0f / %.0f / %.0f\n",
+                        double(casc[0].radius), double(casc[1].radius), double(casc[2].radius),
+                        double(fcb.shadowTexel[0]), double(fcb.shadowTexel[1]), double(fcb.shadowTexel[2]),
+                        double(fcb.shadowSplit[0]), double(fcb.shadowSplit[1]), double(fcb.shadowSplit[2]));
+
+        // ---- Shadow pass -------------------------------------------------------
+        if (shadowsOn) {
+            ID3D11ShaderResourceView* unbind[] = {nullptr};
+            ctx->PSSetShaderResources(3, 1, unbind);        // it is about to be a render target
+            const D3D11_VIEWPORT svp{0.f, 0.f, float(kShadowSize), float(kShadowSize), 0.f, 1.f};
+            ctx->RSSetViewports(1, &svp);
+            ctx->OMSetDepthStencilState(dssShadow.get(), 0);
+            ctx->RSSetState(rsShadowPass.get());
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx->IASetInputLayout(inputLayout.get());
+            ctx->VSSetShader(shadowVs.get(), nullptr, 0);
+            ctx->HSSetShader(nullptr, nullptr, 0);
+            ctx->DSSetShader(nullptr, nullptr, 0);
+            ctx->PSSetShader(nullptr, nullptr, 0);          // depth only
+            ID3D11Buffer* scbs[] = {shadowCB.get()};
+            const UINT stride = sizeof(TerrainVertex), offset = 0;
+
+            for (int c = 0; c < kCascades; ++c) {
+                ctx->OMSetRenderTargets(0, nullptr, shadowDsv[c].get());
+                ctx->ClearDepthStencilView(shadowDsv[c].get(), D3D11_CLEAR_DEPTH, 1.f, 0);
+                ShadowCB scb{};
+                std::memcpy(scb.lightViewProj, casc[c].viewProj.m, sizeof(scb.lightViewProj));
+                D3D11_MAPPED_SUBRESOURCE sm{};
+                ctx->Map(shadowCB.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &sm);
+                std::memcpy(sm.pData, &scb, sizeof(scb));
+                ctx->Unmap(shadowCB.get(), 0);
+                ID3D11Buffer* ccbs[] = {chunkCB.get()};     // b1 holds the chunk offset
+                ctx->VSSetConstantBuffers(1, 1, ccbs);
+                ctx->VSSetConstantBuffers(4, 1, scbs);
+
+                const Cascade& cc = casc[c];
+                for (const auto& [key, e] : gpuChunks.chunks()) {
+                    if (!e.vb || !e.ib || e.indexCount == 0) continue;
+                    const Vec3f rel = Vec3f(e.origin - camera.position);
+                    const Vec3f lo = e.localBounds.min + rel, hi = e.localBounds.max + rel;
+                    // Light-space bounds of the chunk, against the cascade box.
+                    float l0 = 1e30f, l1 = -1e30f, m0 = 1e30f, m1 = -1e30f, n0 = 1e30f, n1 = -1e30f;
+                    for (int b = 0; b < 8; ++b) {
+                        const Vec3f p{(b & 1) ? hi.x : lo.x, (b & 2) ? hi.y : lo.y, (b & 4) ? hi.z : lo.z};
+                        const Vec3f q = p - cc.eye;
+                        const float u = dot(q, cc.ax), v2 = dot(q, cc.ay), w = dot(q, cc.fwd);
+                        l0 = std::min(l0, u); l1 = std::max(l1, u);
+                        m0 = std::min(m0, v2); m1 = std::max(m1, v2);
+                        n0 = std::min(n0, w); n1 = std::max(n1, w);
+                    }
+                    if (l1 < -cc.radius || l0 > cc.radius || m1 < -cc.radius || m0 > cc.radius ||
+                        n1 < 0.f || n0 > cc.zFar)
+                        continue;
+                    ChunkCB ccb{{rel.x, rel.y, rel.z}, float(e.lod),
+                                {float(e.origin.x), float(e.origin.y), float(e.origin.z)}, 0.f};
+                    D3D11_MAPPED_SUBRESOURCE cm{};
+                    ctx->Map(chunkCB.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &cm);
+                    std::memcpy(cm.pData, &ccb, sizeof(ccb));
+                    ctx->Unmap(chunkCB.get(), 0);
+                    ID3D11Buffer* vbs[] = {e.vb.get()};
+                    ctx->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
+                    ctx->IASetIndexBuffer(e.ib.get(), DXGI_FORMAT_R32_UINT, 0);
+                    ctx->DrawIndexed(e.indexCount, 0, 0);
+                    ++shadowDraws;
+                }
+            }
+        }
+
+        ctx->End(tqMark[tr][1].get());
 
         const D3D11_VIEWPORT vp{0.f, 0.f, float(g_input.width), float(g_input.height), 0.f, 1.f};
         ID3D11RenderTargetView* rtvs[] = {rtv.get()};
@@ -2142,6 +2487,12 @@ int main(int argc, char** argv) {
 
         // Terrain. With tessellation the same index buffer is reinterpreted as
         // 3-control-point patches; nothing about the mesh data changes.
+        {
+            ID3D11ShaderResourceView* ssrv[] = {shadowSrv.get()};
+            ID3D11SamplerState* ssmp[] = {shadowSamp.get()};
+            ctx->PSSetShaderResources(3, 1, ssrv);
+            ctx->PSSetSamplers(2, 1, ssmp);
+        }
         ctx->IASetInputLayout(inputLayout.get());
         ctx->IASetPrimitiveTopology(tessOn ? D3D11_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST
                                            : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -2357,6 +2708,23 @@ int main(int argc, char** argv) {
             if (exitAfter <= 0.0) break;
         }
 
+        ctx->End(tqMark[tr][2].get());
+        ctx->End(tqDisjoint[tr].get());
+        if (frameIndex >= kTimerRing) {
+            const int rr = int((frameIndex + 1) % kTimerRing);   // three frames old
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+            uint64_t a = 0, b = 0, c = 0;
+            if (ctx->GetData(tqDisjoint[rr].get(), &dj, sizeof(dj), 0) == S_OK && !dj.Disjoint &&
+                ctx->GetData(tqMark[rr][0].get(), &a, sizeof(a), 0) == S_OK &&
+                ctx->GetData(tqMark[rr][1].get(), &b, sizeof(b), 0) == S_OK &&
+                ctx->GetData(tqMark[rr][2].get(), &c, sizeof(c), 0) == S_OK && dj.Frequency) {
+                const double toMs = 1000.0 / double(dj.Frequency);
+                gpuShadowMs += double(b - a) * toMs;
+                gpuTotalMs += double(c - a) * toMs;
+                ++gpuSamples;
+            }
+        }
+
         swapChain->Present(vsync ? 1 : 0, 0);
         ++frameIndex;
         if (exitAfter > 0.0 && runTime >= exitAfter) break;
@@ -2421,6 +2789,10 @@ int main(int argc, char** argv) {
                     (unsigned long long)frameIndex, farBricks.overflowed() ? "  [ATLAS OVERFLOWED]" : "");
     std::printf("frame time  : %.3f ms mean over %llu frames (%.1f fps)%s\n", runTime * 1000.0 / double(frameIndex),
                 (unsigned long long)frameIndex, double(frameIndex) / runTime, vsync ? " [vsync on]" : "");
+    if (gpuSamples)
+        std::printf("gpu         : %.3f ms per frame, of which %.3f ms shadow cascades (%.0f%%), %.0f draws/frame\n",
+                    gpuTotalMs / double(gpuSamples), gpuShadowMs / double(gpuSamples),
+                    100.0 * gpuShadowMs / std::max(gpuTotalMs, 1e-9), double(shadowDraws) / double(std::max<uint64_t>(1, frameIndex)));
     CoUninitialize();
     return 0;
 }

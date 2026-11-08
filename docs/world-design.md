@@ -856,7 +856,8 @@ part of the world generated without intent.
 
 It is fast, and it is bit-deterministic across SIMD levels, which matters more than it sounds (§8).
 It is also the thing to replace, and it is worth being precise about why rather than asserting that
-noise is bad.
+noise is bad. The LOD cutoff in that last row turns out not to be a cave problem at all, which is why
+it gets a subsection of its own below.
 
 ### §1 is a surface rule, and always was
 
@@ -921,7 +922,86 @@ Four failures, in order of what they cost:
 4. **It does not survive LOD.** `maxCaveLod = 1` is not a tuning choice, it is a consequence — a
    field defined by thresholds has no coarse representation, so caves cease to exist past LOD1.
    Entrances pop in, nothing underground is observable at range (§7), and the navigation graph (§6)
-   has nothing to work with beyond the live area.
+   has nothing to work with beyond the live area. This is the shallow end of a larger problem that is
+   not about caves at all, and the next subsection measures it.
+
+### Voids do not survive coarsening
+
+Found by digging craters in the viewer and flying away from them. It belongs apart from the argument
+above, because it is not a cave problem — it would still be here if every cave were placed by hand.
+
+**Coarse LODs are built by decimation, not by filtering.** A LOD L chunk samples the world on a
+lattice of 2^L metres and keeps whatever happens to land on it. Nothing combines the samples it
+steps over. For a height field that is harmless, because height varies smoothly and a skipped sample
+is close to a kept one. For a *void* it is fatal: a hole is a thin negative-space feature, and the
+correct coarse representation of a hole is a smaller hole, never no hole.
+
+Three mechanisms produce the same symptom, and only one of them is about caves:
+
+| # | Mechanism | Where |
+|---|---|---|
+| 1 | Player edits survive only where their coordinates divide by the LOD stride; the rest are dropped | `DeltaStore::applyTo`, the lattice test |
+| 2 | Procedural caves are not composed at all past LOD1 | `DensityGenerator`, the `maxCaveLod` gate |
+| 3 | The surface field is point-sampled at `step = 2^lod` m with no prefilter, so overhangs and arches alias by the same route | `DensityGenerator`, the `grid2D`/`grid3D` calls |
+
+Mechanism 1 is measurable, and the numbers are worse than they look. Carving a crater into a
+`DeltaStore`, stamping it into each LOD's padded field and counting both the samples that survive
+and the subset of those that read as air:
+
+| Crater radius | LOD1 | LOD2 | LOD3 | LOD4 |
+|---|---|---|---|---|
+| 5 m | 15.3% — 81 air | 2.2% — 7 air | 0.5% — **1 air** | 0.1% — **0 air** |
+| 12 m | 15.9% — 708 air | 3.1% — 93 air | 0.3% — 19 air | 0.02% — 2 air |
+| 25 m | 17.3% — 4,467 air | 3.9% — 967 air | 0.5% — 123 air | 0.06% — 20 air |
+
+The air column is the one that matters, because those are the only samples telling the mesher that a
+void exists. **A 5 m crater is down to one air sample at LOD3 and none at LOD4.** A single isolated
+air sample among solid neighbours does not move a dual-contoured isosurface. The hole does not shrink
+with distance — it blinks out.
+
+So the underground needs a scale-aware representation twice over, for two unrelated reasons:
+
+* **Procedural voids can be parametric.** A capsule that knows its own radius is carved
+  conservatively at any stride, so it thins instead of vanishing. That is layer 3 of the model below,
+  and it is what retires `maxCaveLod`.
+* **Player voids cannot be**, because a dug crater is arbitrary. They need a **mip pyramid**: each
+  coarse sample reduced from the 2^L × 2^L × 2^L fine samples beneath it, rather than chosen from
+  among them.
+
+The reduction operator is the part wanting care rather than a default. A plain mean erases voids
+about as efficiently as decimation does, and a minimum over the block grows them until the world is
+porous. Dual contouring's QEF keeps edges sharp once the data is there; the data is what is missing.
+
+### This is not an argument for a different architecture
+
+The obvious reading of the above is that the chunked-LOD scheme is at fault and that something
+GPU-led — No Man's Sky being the usual reference — would not have the problem. That reading does not
+survive contact with the cause.
+
+**Decimation aliases identically on a GPU.** Moving density evaluation and meshing into compute
+shaders changes where the samples are taken, not how the coarse ones are derived; the holes would
+vanish exactly as they do now, having cost an architecture rewrite first. The framing is a false
+opposition besides — systems of that kind still have chunks and still have LOD. The axes that matter
+are independent of where the work runs.
+
+| Axis | Today | Implicated in the defect? |
+|---|---|---|
+| Where density is evaluated | CPU, SIMD batches | No |
+| How coarse levels are derived | Decimation | **Yes — this is the whole of it** |
+| How voids are represented | Implicit in a noise threshold | **Yes** |
+
+There is also a reason particular to this project to keep base density generation off the GPU. §8
+makes bit-identical regeneration load-bearing twice over: `DeltaStore` stores edits relative to
+regenerated density, and co-op needs two clients to regenerate the same field. That is why
+FastNoise2 is built with strict floating point. Holding that guarantee across GPU vendors and driver
+revisions is a harder problem than the one it would be solving — and Jolt wants CPU-side triangles
+regardless, so a GPU-only mesh path still owes a readback or a second path for collision.
+
+**Keep the architecture; fix the data production.** In order: the delta mip pyramid, which addresses
+what was actually observed and is contained enough to carry a regression test; then parametric cave
+incursions, which retire `maxCaveLod`; then prefiltering the surface noise, before mechanism 3 is
+noticed in the Badlands. GPU meshing remains available later as a throughput decision, which is what
+it always was.
 
 ### What the reference games actually teach
 
@@ -1014,6 +1094,11 @@ Two consequences land immediately:
 * **Entrance placement as a first-class output**, not a shell term. How a player finds the
   underground is §7's legibility problem one level down, and it is currently answered by a noise
   field.
+* **Coarse levels derived by reduction, not decimation** — every LOD sample a filtered function of
+  the fine samples beneath it, for the procedural field and for `DeltaStore` alike. This one is
+  independent of everything else here, and it is the fix for what was actually observed.
+* **A mip pyramid for deltas**, so a dug crater thins with distance instead of disappearing. Cheap
+  in memory — a geometric series over the LOD0 set — and gated on choosing a reduction operator.
 
 **[open]** Where exactly does placement stop and texture begin? Too much placement and every cave is
 a corridor somebody designed; too little and the four failures return wearing a graph. Layer 4's
@@ -1028,6 +1113,12 @@ player has walled off.
 **[open]** How deep does the underground go? §1 gives 512 m below sea level and §5 makes the Hollows
 the cheap way into it, but nothing says whether the network is one layer, several stacked, or
 continuous to bedrock — and that decides whether depth is a progression or a single step down.
+
+**[open]** Which reduction operator builds the coarse levels? A mean erases voids nearly as well as
+decimation does; a minimum over the block grows them until the world is porous. Something biased
+toward extremes is the right shape, but the bias has a visible failure mode at each end, it has to
+hold for added terrain as well as removed, and whatever it does at a chunk boundary has to agree
+with the skirts that already cover LOD seams.
 
 ---
 
